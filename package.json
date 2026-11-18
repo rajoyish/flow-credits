@@ -1,0 +1,19 @@
+{
+  "name": "flow-credits-tracker",
+  "version": "1.0.0",
+  "description": "Local macOS dashboard that tracks Google Flow credits across all your Chrome profiles, with automatic background sync and a Chrome extension.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "private": true,
+  "license": "MIT",
+  "os": [
+    "darwin"
+  ]
+}

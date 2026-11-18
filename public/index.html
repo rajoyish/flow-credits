@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Flow Credits</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app-container">
+    <header class="top-header">
+      <div class="brand">
+        <div class="brand-icon">✦</div>
+        <div>
+          <h1 class="brand-title">Flow Credits</h1>
+          <p class="brand-subtitle">Google Flow credits across your Chrome profiles</p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button class="btn btn-success" id="btnSyncAll">⟳ Sync all</button>
+        <button class="btn btn-primary" id="btnAddAccount">+ Add accounts</button>
+      </div>
+    </header>
+
+    <section class="summary-grid">
+      <div class="stat-card">
+        <div class="stat-label">Available credits</div>
+        <div class="stat-value" id="statTotalCredits">0</div>
+        <div class="stat-sub" id="statTotalAllowance"></div>
+      </div>
+      <div class="stat-card highlight-card">
+        <div class="stat-label">★ Use next</div>
+        <div class="stat-value" id="statRecommendedName" style="font-size:19px; margin-top:2px;">—</div>
+        <div class="stat-sub" id="statRecommendedReason"></div>
+        <div style="margin-top:10px; display:none;" id="recommendedActions">
+          <button class="btn btn-sm btn-primary" id="btnLaunchRecommended">Open Flow</button>
+        </div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Expiring within 7 days</div>
+        <div class="stat-value" id="statExpiringSoon">0</div>
+        <div class="stat-sub">Monthly credits don't roll over</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Synced accounts</div>
+        <div class="stat-value" id="statSyncedAccounts">0</div>
+        <div class="stat-sub" id="statUsedThisCycle"></div>
+      </div>
+    </section>
+
+    <section class="sync-panel" id="syncPanel">
+      <div class="sync-panel-head">
+        <div>
+          <div class="sync-title" id="syncTitle">Sync</div>
+          <div class="sync-sub" id="syncSub"></div>
+        </div>
+        <div class="sync-controls">
+          <label class="auto-sync"><input type="checkbox" id="autoSyncToggle" /> Auto-sync every</label>
+          <select id="autoSyncInterval">
+            <option value="1">1 hour</option>
+            <option value="3">3 hours</option>
+            <option value="6">6 hours</option>
+            <option value="12">12 hours</option>
+            <option value="24">24 hours</option>
+          </select>
+          <button class="btn btn-sm btn-danger" id="btnCancelSync" style="display:none">Stop</button>
+        </div>
+      </div>
+      <div class="setup-banner" id="setupBanner" style="display:none">
+        <span id="setupBannerText"></span>
+        <button class="btn btn-sm btn-primary" id="btnOpenSetup">Set up extension</button>
+      </div>
+      <div class="sync-track"><div class="sync-fill" id="syncFill"></div></div>
+      <div class="sync-items" id="syncItems"></div>
+    </section>
+
+    <div id="accountsContainer"></div>
+
+    <footer class="app-footer">
+      <label class="auto-sync"><input type="checkbox" id="startAtLoginToggle" /> Start at login</label>
+      <button class="btn btn-sm" id="btnStopServer">Stop server</button>
+    </footer>
+  </div>
+
+  <!-- Add accounts from Chrome profiles -->
+  <div class="modal-backdrop" id="profilesModalBackdrop">
+    <div class="modal" style="max-width:620px;">
+      <div class="modal-header">
+        <h3 class="modal-title">Add accounts from Chrome</h3>
+        <button class="btn btn-sm" id="btnCloseProfilesModal">✕</button>
+      </div>
+      <p class="profiles-hint">Each Chrome profile's Google account. Credits fill in on the next sync.</p>
+      <div id="profilesList" class="profiles-list"></div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-primary" id="btnAddAllProfiles">Add all</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- One-time extension setup per Chrome profile -->
+  <div class="modal-backdrop" id="setupModalBackdrop">
+    <div class="modal" style="max-width:620px;">
+      <div class="modal-header">
+        <h3 class="modal-title">Install the extension in each Chrome profile</h3>
+        <button class="btn btn-sm" id="btnCloseSetupModal">✕</button>
+      </div>
+      <ol class="setup-steps">
+        <li>Click <strong>Open Extensions</strong> on a profile below. Its Extensions page opens, and the folder path is copied.</li>
+        <li>Turn on <strong>Developer mode</strong> (top right), then click <strong>Load unpacked</strong>.</li>
+        <li>In the folder picker, press <kbd>⌘</kbd><kbd>⇧</kbd><kbd>G</kbd>, then <kbd>⌘</kbd><kbd>V</kbd>, <kbd>Return</kbd>, and click <strong>Select</strong>.</li>
+      </ol>
+      <p class="profiles-hint">Profiles tick themselves off once Chrome has the extension loaded.</p>
+      <div id="setupList" class="profiles-list"></div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-success" id="btnSetupSyncNow">⟳ Sync all</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast-container" id="toastContainer"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

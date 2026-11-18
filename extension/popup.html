@@ -1,0 +1,50 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    :root {
+      --bg: #0b0f17; --hover: #1b2332; --border: rgba(255,255,255,0.08);
+      --text: #f3f6fc; --muted: #9ba8be; --faint: #64748b;
+      --accent: #6366f1; --ok: #10b981; --warn: #f59e0b; --bad: #ef4444;
+    }
+    * { box-sizing: border-box; }
+    html { color-scheme: dark; }
+    body { margin: 0; width: 300px; background: var(--bg); color: var(--text);
+      font: 13px/1.4 -apple-system, BlinkMacSystemFont, sans-serif; }
+    header { padding: 14px 16px 10px; }
+    .total { font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .sub { color: var(--muted); font-size: 12px; }
+    #list { max-height: 380px; overflow-y: auto; padding: 0 6px; border-top: 1px solid var(--border); }
+    .row { display: flex; justify-content: space-between; align-items: baseline; gap: 10px;
+      padding: 7px 10px; border-radius: 6px; cursor: pointer; }
+    .row:hover { background: var(--hover); }
+    .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .next { color: var(--ok); }
+    .right { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .credits { font-weight: 600; }
+    .low { color: var(--bad); } .mid { color: var(--warn); }
+    .meta { color: var(--faint); font-size: 11px; margin-left: 6px; }
+    .dim { color: var(--faint); }
+    footer { padding: 10px 12px; border-top: 1px solid var(--border); display: flex; gap: 8px; align-items: center; }
+    button { flex: 1; background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+      padding: 8px; font: inherit; font-weight: 600; cursor: pointer; }
+    button:disabled { opacity: .7; cursor: default; }
+    a { color: var(--muted); font-size: 12px; text-decoration: none; }
+    a:hover { color: var(--text); }
+    .empty { padding: 20px 10px; color: var(--muted); text-align: center; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="total" id="total">—</div>
+    <div class="sub" id="sub">Available Flow credits</div>
+  </header>
+  <div id="list"></div>
+  <footer>
+    <button id="sync">Sync all</button>
+    <a href="#" id="dash">Dashboard ↗</a>
+  </footer>
+  <script src="popup.js"></script>
+</body>
+</html>

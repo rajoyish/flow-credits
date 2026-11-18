@@ -1,0 +1,11 @@
+# Local data: your accounts, emails, settings and logs
+data/
+
+# OS / editor
+.DS_Store
+*.log
+.vscode/
+.idea/
+
+# Dependencies (none today)
+node_modules/
