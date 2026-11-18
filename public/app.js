@@ -67,8 +67,12 @@ function renderSummary() {
   $('btnLaunchRecommended').onclick = () => rec && openFlow(rec.id);
 }
 
+// Synced accounts on a monthly reset are Google AI Pro; free accounts refresh daily.
+const isPro = (acc) => acc.is_synced && acc.reset_period !== 'daily';
+
 function sortedAccounts() {
   return [...state.accounts].sort((a, b) => {
+    if (isPro(a) !== isPro(b)) return isPro(a) ? -1 : 1;
     if (a.is_synced !== b.is_synced) return a.is_synced ? -1 : 1;
     if (a.is_synced && b.urgency_score !== a.urgency_score) return b.urgency_score - a.urgency_score;
     return (a.label || a.email).localeCompare(b.label || b.email);
@@ -77,9 +81,11 @@ function sortedAccounts() {
 
 function creditsBox(acc) {
   if (!acc.is_synced) {
-    const hint = acc.extension_installed
-      ? 'Extension installed. It syncs on the next “Sync all”.'
-      : `Extension not installed in this Chrome profile. <a href="#" onclick="openSetupModal(); return false;">Set up extension</a>`;
+    const hint = state.summary.cookie_sync
+      ? 'Syncs automatically on the next “⟳ Sync all”.'
+      : acc.extension_installed
+        ? 'Extension installed. It syncs on the next “Sync all”.'
+        : `Extension not installed in this Chrome profile. <a href="#" onclick="openSetupModal(); return false;">Set up extension</a>`;
     return `<div class="credit-meter-box unsynced"><div class="credits-total">Not synced yet</div><p class="unsynced-hint">${hint}</p></div>`;
   }
   const pct = acc.remaining_percent;
@@ -127,7 +133,7 @@ function renderAccounts() {
             <div class="account-identity">
               <div class="avatar-dot" style="background:${escapeHtml(acc.color || '#6366f1')}">${escapeHtml((acc.label || acc.email).slice(0, 2).toUpperCase())}</div>
               <div style="min-width:0;">
-                <div class="account-title">${escapeHtml(acc.label || acc.email)}</div>
+                <div class="account-title"><span class="account-name">${escapeHtml(acc.label || acc.email)}</span>${isPro(acc) ? '<span class="pro-badge" title="Google AI Pro">PRO</span>' : ''}</div>
                 <div class="account-email">${escapeHtml(acc.email)}</div>
               </div>
             </div>
@@ -210,6 +216,12 @@ async function importProfiles(profileDirs) {
 let setupPoll = null;
 
 function renderSetupBanner() {
+  // Silent cookie sync needs no extension, so don't nag about it when that's working.
+  // The extension is then only for the optional toolbar popup, reachable from the sync panel.
+  if (state.summary.cookie_sync) {
+    $('setupBanner').style.display = 'none';
+    return;
+  }
   const missing = state.accounts.filter((a) => a.chrome_profile && !a.extension_installed);
   $('setupBanner').style.display = missing.length ? 'flex' : 'none';
   $('setupBannerText').textContent = `${missing.length} of ${state.accounts.length} Chrome profiles still need the extension (one-time setup).`;
@@ -265,7 +277,9 @@ function renderSyncJob(job) {
   const auto = syncSettings && syncSettings.auto_sync;
   if (job.running) {
     $('syncTitle').textContent = `Syncing ${Math.min(job.done + 1, job.total)} of ${job.total}${current ? ` · ${current.label}` : ''}`;
-    $('syncSub').textContent = 'Opening Flow in each Chrome profile. Windows close by themselves.';
+    $('syncSub').textContent = state.summary.cookie_sync
+      ? 'Reading each account’s balance in the background. No windows open.'
+      : 'Opening Flow in each Chrome profile. Windows close by themselves.';
   } else if (job.finished_at) {
     const parts = [`${count('synced')} updated`];
     if (count('failed')) parts.push(`${count('failed')} failed`);

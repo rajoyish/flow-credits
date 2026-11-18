@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { spawn, execFile } from 'node:child_process';
 import crypto from 'node:crypto';
+import { cookieSyncAvailable, readFlowBalance } from './lib/flow-cookie-sync.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -250,6 +251,14 @@ function writeJsonBackupNow() {
   }
 }
 
+// Whether silent cookie sync is available, checked once and cached (avoids re-spawning
+// the `security` Keychain lookup on every state fetch).
+let cookieSyncReadyCache = null;
+function cookieSyncReady() {
+  if (cookieSyncReadyCache === null) cookieSyncReadyCache = cookieSyncAvailable();
+  return cookieSyncReadyCache;
+}
+
 function getAllAccountsWithSummary() {
   processAutomaticMonthlyResets();
   const rawAccounts = prepare('SELECT * FROM accounts ORDER BY created_at ASC').all();
@@ -286,7 +295,8 @@ function getAllAccountsWithSummary() {
       ? `${recommendedAccount.available_credits.toLocaleString()} credits expiring in ${recommendedAccount.days_until_reset} day${recommendedAccount.days_until_reset === 1 ? '' : 's'} (~${recommendedAccount.recommended_daily_spend}/day)`
       : synced.length
         ? 'No synced accounts with remaining credits'
-        : 'No accounts synced yet. Open Flow in each Chrome profile.'
+        : 'No accounts synced yet. Click ⟳ Sync all.',
+    cookie_sync: cookieSyncReady()
   };
 
   return { accounts: enriched, summary };
@@ -634,6 +644,9 @@ async function runSyncJob(trigger, accountIds = null) {
   const accountById = new Map(accounts.map((a) => [a.id, a]));
 
   (async () => {
+    // Silent sync reads each profile's Flow balance from its cookies, no window opened.
+    // It needs no extension; the window method stays as the fallback.
+    const useCookie = cookieSyncReady();
     for (const item of syncJob.items) {
       if (syncJob.cancelled) {
         item.status = 'skipped';
@@ -646,13 +659,36 @@ async function runSyncJob(trigger, accountIds = null) {
         item.message = 'No Chrome profile linked';
         continue;
       }
-      if (!profileHasExtension(acc.chrome_profile)) {
-        item.status = 'skipped';
-        item.message = 'Extension not installed in this Chrome profile';
-        continue;
-      }
       item.status = 'syncing';
       broadcast('job');
+
+      // 1) Preferred: silent sync straight from the profile's cookies.
+      if (useCookie) {
+        try {
+          const reading = await readFlowBalance(acc.chrome_profile);
+          const result = applyReading({ ...reading, account_id: acc.id });
+          if (result.status !== 200) throw new Error(result.body.error || 'Reading rejected');
+          item.status = 'synced';
+          item.credits = reading.available_credits;
+          item.message = 'Synced silently';
+          broadcast('job');
+          continue;
+        } catch (err) {
+          item.message = `Silent sync failed: ${err.message}`;
+          broadcast('job');
+          // Fall through to the window method if the extension is available.
+        }
+      }
+
+      // 2) Fallback: open Flow in the profile and let the extension report back.
+      if (!profileHasExtension(acc.chrome_profile)) {
+        // Silent sync off and no extension => nothing can sync this one (skip).
+        // Silent sync tried and failed with no extension to fall back to => surface the failure.
+        item.status = useCookie ? 'failed' : 'skipped';
+        if (!useCookie) item.message = 'Extension not installed in this Chrome profile';
+        broadcast('job');
+        continue;
+      }
       try {
         const credits = await new Promise((resolve, reject) => {
           // Every exit path clears the timer and the waiter, so nothing outlives this account.
@@ -676,6 +712,7 @@ async function runSyncJob(trigger, accountIds = null) {
         });
         item.status = 'synced';
         item.credits = credits;
+        item.message = '';
         broadcast('job');
       } catch (err) {
         item.status = 'failed';
@@ -748,6 +785,206 @@ const MIME_TYPES = {
   '.png': 'image/png',
   '.ico': 'image/x-icon'
 };
+
+// Standard monthly Google AI Pro Flow grant. Used as a floor for Pro accounts.
+const PRO_MONTHLY_ALLOWANCE = 1000;
+
+/**
+ * Infer an account's monthly_allowance. Flow's API doesn't report the grant, so:
+ *  - Free (daily) accounts always get 50.
+ *  - Pro (monthly) accounts get at least the standard Pro grant, at least the credits
+ *    currently available (a fresh or topped-up balance can exceed the base grant), and
+ *    never less than a known larger allowance (e.g. an Ultra tier already on file).
+ * Using max() means the value only ever grows, so a stale free-tier default (50) stuck
+ * on a Pro account is corrected on the next sync without ever shrinking a real grant.
+ */
+function inferMonthlyAllowance(period, availableNow, existing) {
+  if (period === 'daily') return 50;
+  return Math.max(existing || 0, availableNow || 0, PRO_MONTHLY_ALLOWANCE);
+}
+
+/**
+ * Apply one Flow credit reading to the database: find or create the account, update
+ * its balance / reset date / plan, and log the delta. Shared by the Chrome extension
+ * endpoint (/api/sync-inbound) and the silent cookie sync. Returns { status, body }.
+ *
+ * Accepts either structured fields (available_credits, next_reset_date, reset_period,
+ * plan_name, monthly_allowance, reset_day) or raw page text to parse.
+ */
+function applyReading(body) {
+  const nowIso = new Date().toISOString();
+
+  const parsed = parseGoogleCreditsText(body.raw_text || '');
+  console.log(
+    `[sync-inbound] ${body.email || '?'}: credits=${body.available_credits ?? parsed.available_credits} reset=${
+      body.next_reset_date || parsed.next_reset_date
+    } (${body.reset_period || parsed.reset_period || 'no date found'})`
+  );
+  const email = ((body.email || parsed.email || '') + '').trim().toLowerCase();
+  const accountId = body.account_id || null;
+
+  let target = null;
+  if (accountId) {
+    target = prepare('SELECT * FROM accounts WHERE id = ?').get(accountId);
+  }
+  if (!target && email) {
+    target = prepare('SELECT * FROM accounts WHERE email = ?').get(email);
+  }
+
+  const avail =
+    body.available_credits !== undefined && body.available_credits !== null
+      ? Number(body.available_credits)
+      : parsed.available_credits;
+  const allowance =
+    body.monthly_allowance !== undefined && body.monthly_allowance !== null
+      ? Number(body.monthly_allowance)
+      : parsed.monthly_allowance;
+  const resetDay =
+    body.reset_day !== undefined && body.reset_day !== null ? Number(body.reset_day) : parsed.reset_day;
+  const nextResetDate = body.next_reset_date || parsed.next_reset_date || null;
+  const resetPeriod = body.reset_period || parsed.reset_period || null;
+
+  // No balance found on the page (e.g. Flow's account panel was closed): don't mark the account as synced.
+  if (avail === null || avail === undefined || Number.isNaN(Number(avail))) {
+    return {
+      status: 422,
+      body: {
+        error: 'No credit balance found. In Flow, click your avatar to open the account panel, then sync again.',
+        parsed
+      }
+    };
+  }
+
+  if (!target && !email) {
+    return {
+      status: 400,
+      body: {
+        error:
+          'Could not identify which Google account to sync. Please select an account or ensure your Google email is visible on the page.',
+        parsed
+      }
+    };
+  }
+
+  // If account doesn't exist yet and we have an email, auto-create it!
+  if (!target && email) {
+    const id = crypto.randomUUID();
+    const rDay = resetDay || new Date().getDate();
+    const nReset = nextResetDate || computeNextResetDate(rDay);
+    const aCredits = avail !== null && avail !== undefined ? avail : allowance || 0;
+    const mAllowance = inferMonthlyAllowance(resetPeriod || 'monthly', aCredits, allowance);
+    const plan = body.plan_name || (resetPeriod === 'daily' ? 'Free' : 'Google AI Pro');
+
+    prepare(`
+      INSERT INTO accounts (
+        id, email, label, plan_name, available_credits, monthly_allowance,
+        topup_credits, reset_day, next_reset_date, last_reset_cycle,
+        chrome_profile, status, notes, color, last_synced_at, sync_source,
+        created_at, updated_at, reset_period
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      email,
+      email.split('@')[0],
+      plan,
+      aCredits,
+      mAllowance,
+      0,
+      rDay,
+      nReset,
+      '',
+      '',
+      'active',
+      'Auto-created via Google Browser Sync',
+      '#6366f1',
+      nowIso,
+      body.source || 'browser-sync',
+      nowIso,
+      nowIso,
+      resetPeriod || 'monthly'
+    );
+
+    prepare(`
+      INSERT INTO credit_logs (id, account_id, delta, balance_after, reason, source, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(crypto.randomUUID(), id, aCredits, aCredits, 'Auto-synced from Google AI Credits page', body.source || 'browser-sync', nowIso);
+
+    writeJsonBackup();
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        action: 'created',
+        close_tab: resolveJobItem(email, aCredits),
+        email,
+        available_credits: aCredits,
+        ...getAllAccountsWithSummary()
+      }
+    };
+  }
+
+  // Update existing account
+  const updatedAvail = avail !== null && avail !== undefined && !Number.isNaN(avail) ? avail : target.available_credits;
+  const updatedResetDay =
+    resetDay !== null && resetDay !== undefined && !Number.isNaN(resetDay) ? resetDay : target.reset_day;
+  const updatedNextReset = nextResetDate || computeNextResetDate(updatedResetDay);
+  const updatedPeriod = resetPeriod || target.reset_period || 'monthly';
+  // Flow's API omits the monthly grant; infer it. An explicitly-reported allowance (rare,
+  // from page text) is used as the baseline but still floored for the plan.
+  const allowanceBaseline =
+    allowance !== null && allowance !== undefined && !Number.isNaN(allowance) ? allowance : target.monthly_allowance;
+  const updatedAllowance = inferMonthlyAllowance(updatedPeriod, updatedAvail, allowanceBaseline);
+  const updatedPlan =
+    body.plan_name || (updatedPeriod === 'daily' ? 'Free' : updatedPeriod === 'monthly' ? 'Google AI Pro' : target.plan_name);
+
+  const delta = updatedAvail - target.available_credits;
+
+  prepare(`
+    UPDATE accounts
+    SET available_credits = ?,
+        monthly_allowance = ?,
+        reset_day = ?,
+        next_reset_date = ?,
+        reset_period = ?,
+        plan_name = ?,
+        last_synced_at = ?,
+        sync_source = ?,
+        updated_at = ?
+    WHERE id = ?
+  `).run(
+    updatedAvail,
+    updatedAllowance,
+    updatedResetDay,
+    updatedNextReset,
+    updatedPeriod,
+    updatedPlan,
+    nowIso,
+    body.source || 'browser-sync',
+    nowIso,
+    target.id
+  );
+
+  if (delta !== 0) {
+    prepare(`
+      INSERT INTO credit_logs (id, account_id, delta, balance_after, reason, source, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(crypto.randomUUID(), target.id, delta, updatedAvail, 'Synced from Google AI Credits / Flow', body.source || 'browser-sync', nowIso);
+  }
+
+  writeJsonBackup();
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      action: 'updated',
+      close_tab: resolveJobItem(target.email, updatedAvail),
+      email: target.email,
+      available_credits: updatedAvail,
+      next_reset_date: updatedNextReset,
+      ...getAllAccountsWithSummary()
+    }
+  };
+}
 
 const server = http.createServer(async (req, res) => {
   // Enable CORS so the 1-Click Bookmarklet & Chrome Extension on one.google.com or labs.google can post directly to localhost
@@ -932,176 +1169,11 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, ...info });
     }
 
-    // POST /api/sync-inbound -> called by the Chrome extension with a Flow reading
+    // POST /api/sync-inbound -> called by the Chrome extension and the silent cookie sync with a Flow reading
     if (req.method === 'POST' && pathname === '/api/sync-inbound') {
       const body = await readJsonBody(req);
-      const nowIso = new Date().toISOString();
-
-      // Can receive either structured fields OR raw page text from one.google.com/ai/credits / labs.google
-      const parsed = parseGoogleCreditsText(body.raw_text || '');
-      console.log(`[sync-inbound] ${body.email || '?'}: credits=${body.available_credits ?? parsed.available_credits} reset=${parsed.next_reset_date} (${parsed.reset_period || 'no date found'})`);
-      const email = ((body.email || parsed.email || '') + '').trim().toLowerCase();
-      const accountId = body.account_id || null;
-
-      let target = null;
-      if (accountId) {
-        target = prepare('SELECT * FROM accounts WHERE id = ?').get(accountId);
-      }
-      if (!target && email) {
-        target = prepare('SELECT * FROM accounts WHERE email = ?').get(email);
-      }
-
-      const avail =
-        body.available_credits !== undefined && body.available_credits !== null
-          ? Number(body.available_credits)
-          : parsed.available_credits;
-      const allowance =
-        body.monthly_allowance !== undefined && body.monthly_allowance !== null
-          ? Number(body.monthly_allowance)
-          : parsed.monthly_allowance;
-      const resetDay =
-        body.reset_day !== undefined && body.reset_day !== null
-          ? Number(body.reset_day)
-          : parsed.reset_day;
-      const nextResetDate = body.next_reset_date || parsed.next_reset_date || null;
-
-      // No balance found on the page (e.g. Flow's account panel was closed): don't mark the account as synced.
-      if (avail === null || avail === undefined || Number.isNaN(Number(avail))) {
-        return sendJson(res, 422, {
-          error: 'No credit balance found. In Flow, click your avatar to open the account panel, then sync again.',
-          parsed
-        });
-      }
-
-      if (!target && !email) {
-        return sendJson(res, 400, {
-          error: 'Could not identify which Google account to sync. Please select an account or ensure your Google email is visible on the page.',
-          parsed
-        });
-      }
-
-      // If account doesn't exist yet and we have an email, auto-create it!
-      if (!target && email) {
-        const id = crypto.randomUUID();
-        const rDay = resetDay || new Date().getDate();
-        const nReset = nextResetDate || computeNextResetDate(rDay);
-        const mAllowance = allowance || 1000;
-        const aCredits = avail !== null && avail !== undefined ? avail : mAllowance;
-
-        prepare(`
-          INSERT INTO accounts (
-            id, email, label, plan_name, available_credits, monthly_allowance,
-            topup_credits, reset_day, next_reset_date, last_reset_cycle,
-            chrome_profile, status, notes, color, last_synced_at, sync_source,
-            created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(
-          id,
-          email,
-          email.split('@')[0],
-          'Google AI Pro',
-          aCredits,
-          mAllowance,
-          0,
-          rDay,
-          nReset,
-          '',
-          '',
-          'active',
-          'Auto-created via Google Browser Sync',
-          '#6366f1',
-          nowIso,
-          body.source || 'browser-sync',
-          nowIso,
-          nowIso
-        );
-
-        prepare(`
-          INSERT INTO credit_logs (id, account_id, delta, balance_after, reason, source, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?)
-        `).run(
-          crypto.randomUUID(),
-          id,
-          aCredits,
-          aCredits,
-          'Auto-synced from Google AI Credits page',
-          body.source || 'browser-sync',
-          nowIso
-        );
-
-        writeJsonBackup();
-        return sendJson(res, 200, {
-          ok: true,
-          action: 'created',
-          close_tab: resolveJobItem(email, aCredits),
-          email,
-          available_credits: aCredits,
-          ...getAllAccountsWithSummary()
-        });
-      }
-
-      // Update existing account
-      const updatedAvail = avail !== null && avail !== undefined && !Number.isNaN(avail) ? avail : target.available_credits;
-      const updatedAllowance =
-        allowance !== null && allowance !== undefined && !Number.isNaN(allowance) ? allowance : target.monthly_allowance;
-      const updatedResetDay =
-        resetDay !== null && resetDay !== undefined && !Number.isNaN(resetDay) ? resetDay : target.reset_day;
-      const updatedNextReset = nextResetDate || computeNextResetDate(updatedResetDay);
-      const updatedPeriod = parsed.reset_period || target.reset_period || 'monthly';
-      const updatedPlan = parsed.reset_period === 'daily' ? 'Free' : parsed.reset_period === 'monthly' ? 'Google AI Pro' : target.plan_name;
-
-      const delta = updatedAvail - target.available_credits;
-
-      prepare(`
-        UPDATE accounts
-        SET available_credits = ?,
-            monthly_allowance = ?,
-            reset_day = ?,
-            next_reset_date = ?,
-            reset_period = ?,
-            plan_name = ?,
-            last_synced_at = ?,
-            sync_source = ?,
-            updated_at = ?
-        WHERE id = ?
-      `).run(
-        updatedAvail,
-        updatedAllowance,
-        updatedResetDay,
-        updatedNextReset,
-        updatedPeriod,
-        updatedPlan,
-        nowIso,
-        body.source || 'browser-sync',
-        nowIso,
-        target.id
-      );
-
-      if (delta !== 0) {
-        prepare(`
-          INSERT INTO credit_logs (id, account_id, delta, balance_after, reason, source, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?)
-        `).run(
-          crypto.randomUUID(),
-          target.id,
-          delta,
-          updatedAvail,
-          'Synced from Google AI Credits / Flow',
-          body.source || 'browser-sync',
-          nowIso
-        );
-      }
-
-      writeJsonBackup();
-      return sendJson(res, 200, {
-        ok: true,
-        action: 'updated',
-        close_tab: resolveJobItem(target.email, updatedAvail),
-        email: target.email,
-        available_credits: updatedAvail,
-        next_reset_date: updatedNextReset,
-        ...getAllAccountsWithSummary()
-      });
+      const result = applyReading(body);
+      return sendJson(res, result.status, result.body);
     }
 
     // Serve static files from public/

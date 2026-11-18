@@ -267,8 +267,13 @@ body {
 }
 
 .account-title {
+  display: flex;
+  align-items: center;
   font-size: 15.5px;
   font-weight: 700;
+  min-width: 0;
+}
+.account-name {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -617,4 +622,18 @@ kbd {
   border-top: 1px solid var(--border-subtle);
   font-size: 13px;
   color: var(--text-secondary);
+}
+
+.pro-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  line-height: 16px;
+  flex-shrink: 0;
+  color: #fff;
+  background: linear-gradient(135deg, #6366f1 0%, #06b6d4 100%);
 }

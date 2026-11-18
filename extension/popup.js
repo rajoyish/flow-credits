@@ -12,7 +12,7 @@ function row(a, recId) {
   const cls = pct <= 20 ? 'low' : pct <= 50 ? 'mid' : '';
   const reset = a.reset_period === 'daily' ? 'daily' : a.days_until_reset === 0 ? 'today' : `${a.days_until_reset}d`;
   return `<div class="row" data-id="${esc(a.id)}" title="${esc(a.email)} · open Flow">
-    <span class="name ${a.id === recId ? 'next' : ''}">${a.id === recId ? '★ ' : ''}${name}</span>
+    <span class="name ${a.id === recId ? 'next' : ''}">${a.id === recId ? '★ ' : ''}${name}${a.reset_period !== 'daily' ? '<span class="pro">PRO</span>' : ''}</span>
     <span class="right"><span class="credits ${cls}">${(a.available_credits + (a.topup_credits || 0)).toLocaleString()}</span><span class="meta">${reset}</span></span>
   </div>`;
 }
@@ -27,7 +27,10 @@ async function refresh() {
     $('total').textContent = summary.total_available_credits.toLocaleString();
     $('sub').textContent = rec ? `Use next: ${rec.label || rec.email}` : `${summary.synced_accounts} of ${summary.total_accounts} synced`;
 
-    const synced = accounts.filter((a) => a.is_synced).sort((a, b) => b.urgency_score - a.urgency_score);
+    const isPro = (a) => a.reset_period !== 'daily';
+    const synced = accounts
+      .filter((a) => a.is_synced)
+      .sort((a, b) => isPro(b) - isPro(a) || b.urgency_score - a.urgency_score);
     const rest = accounts.filter((a) => !a.is_synced);
     $('list').innerHTML = accounts.length
       ? [...synced, ...rest].map((a) => row(a, summary.recommended_account_id)).join('')

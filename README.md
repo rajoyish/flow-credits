@@ -3,10 +3,10 @@
 A local macOS dashboard that tracks the **Google Flow credits** of every Google account in your Chrome profiles, and tells you which account to use next before its credits reset.
 
 - Finds your Google accounts from your Chrome profiles: no forms to fill in.
-- Syncs every account's balance and reset date automatically in the background.
+- Syncs every account's balance and reset date silently in the background — no windows open.
 - Knows the difference between **Google AI Pro** accounts (monthly reset) and **free** accounts (50 credits that refresh daily).
 - Recommends which account to use next, so monthly credits don't expire unused.
-- Includes a Chrome extension with a toolbar popup showing every account at a glance.
+- Includes an optional Chrome extension with a toolbar popup showing every account at a glance.
 
 Everything runs on your Mac. No data leaves it.
 
@@ -22,15 +22,19 @@ No `npm install` is needed: there are no dependencies.
 
 1. **Start the server.** Double-click **`Start Flow Credits.command`** (or run `npm start`). The dashboard opens at <http://localhost:3847>.
 2. **Add your accounts.** Click **+ Add accounts → Add all**. Accounts are read from your Chrome profiles.
-3. **Install the extension in each Chrome profile** (one time, about 20 seconds per profile). Click **Set up extension** in the sync panel, then for each profile:
-   1. Click **Open Extensions**. That profile's `chrome://extensions` page opens and the extension folder path is copied.
-   2. Turn on **Developer mode** (top right), then click **Load unpacked**.
-   3. In the folder picker press <kbd>⌘</kbd><kbd>⇧</kbd><kbd>G</kbd>, then <kbd>⌘</kbd><kbd>V</kbd>, <kbd>Return</kbd>, and click **Select**.
+3. **Sync.** Click **⟳ Sync all**. The first sync shows a one-time macOS prompt — *"Flow Credits wants to use the Chrome Safe Storage key"* — click **Always Allow**. From then on it syncs silently and automatically, with no windows.
 
-   Each profile ticks itself off once Chrome has loaded the extension.
-4. **Sync.** Click **⟳ Sync all**. From then on it syncs automatically.
+That's it. Syncing reads each profile's Flow balance in the background; **no Chrome extension is required.**
 
-Chrome only runs an extension in the profiles it is installed in, so step 3 is needed once per profile.
+### Optional: the toolbar popup
+
+If you want every account's credits in a Chrome toolbar popup, install the extension in each profile (one time, about 20 seconds each). Click **Set up extension** in the sync panel, then for each profile:
+
+1. Click **Open Extensions**. That profile's `chrome://extensions` page opens and the extension folder path is copied.
+2. Turn on **Developer mode** (top right), then click **Load unpacked**.
+3. In the folder picker press <kbd>⌘</kbd><kbd>⇧</kbd><kbd>G</kbd>, then <kbd>⌘</kbd><kbd>V</kbd>, <kbd>Return</kbd>, and click **Select**.
+
+Chrome only runs an extension in the profiles it is installed in, so this is needed once per profile.
 
 ## Using it
 
@@ -59,22 +63,21 @@ The LaunchAgent points at the Node.js binary that was running when you turned th
 
 ## How syncing works
 
-1. For each account, the server opens `https://flow.google.com/?fct_sync=1` in a new window of that account's Chrome profile.
-2. The extension opens Flow's account panel (your avatar), reads the email, credit balance and "Resets …" / "Credits refresh daily …" line, and sends them to the server.
-3. The extension closes that window, plus any empty New Tab window Chrome opened alongside it. Windows with your own tabs stay open.
-4. The dashboard and popup update straight away.
+**Silent sync (default).** For each account, the server reads that Chrome profile's `flow.google.com` login cookies straight from disk, decrypts them with the key macOS keeps in your Keychain, and asks Flow for the balance and reset date over Flow's own request — the same data the account panel shows. Nothing opens on screen. All your accounts sync in a few seconds, and Chrome doesn't even need to be running.
 
-Opening Flow yourself in any profile also syncs that account. Profiles without the extension are skipped and shown in the setup banner.
+The Keychain key is read once per server run (the one-time *"Always Allow"* prompt); cookies are copied to a temp file and read there, never modified. See `lib/flow-cookie-sync.js`.
 
-The extension reloads itself whenever its files change, so updates reach every profile automatically after its next sync.
+**Window fallback.** If silent sync can't run (not macOS/Chrome, the Keychain prompt was declined, or a profile's cookies don't work), the server falls back to the old method for that account: it opens `https://flow.google.com/?fct_sync=1` in a new window of the profile, the extension reads the account panel and reports back, then the window closes itself. This path needs the extension installed in that profile.
+
+Either way, opening Flow yourself in any profile also syncs that account, and the dashboard and popup update straight away.
 
 ## Data and privacy
 
 - **Database:** account data is stored in `data/flow-credits.db` (SQLite), with an automatic JSON copy in `data/accounts-backup.json`.
 - **Settings and log:** auto-sync settings are in `data/settings.json`, and the server log in `data/server.log`.
-- **Local only:** the server only listens on `127.0.0.1`, and the extension only talks to `localhost:3847`.
-- **What the server reads from Chrome:** the server reads Chrome's `Local State` file to list profiles and their signed-in email, and each profile's preferences file to check whether the extension is installed. It never reads cookies, passwords or browsing data.
-- **The `tabs` permission** is used only to find and close the windows opened for a sync.
+- **Local only:** the server only listens on `127.0.0.1`, the extension only talks to `localhost:3847`, and nothing is sent anywhere except directly to Google's own `flow.google.com` to read your balance — exactly as your browser does.
+- **What the server reads from Chrome:** Chrome's `Local State` file (to list profiles and their signed-in email), each profile's preferences file (to check whether the extension is installed), and — for silent sync — each profile's `flow.google.com` cookies, which it decrypts with the Chrome Safe Storage key from your Keychain and uses only to fetch that account's Flow credit balance. Cookies are read from a temporary copy and never modified; nothing is logged or stored beyond the balance and reset date. It does not read passwords or other sites' cookies.
+- **The `tabs` permission** (extension only) is used only to find and close the windows opened by the fallback sync.
 
 `data/` is excluded from git.
 
@@ -82,6 +85,7 @@ The extension reloads itself whenever its files change, so updates reach every p
 
 ```
 server.js                    HTTP server, SQLite, Chrome profile detection, sync runner, LaunchAgent
+lib/flow-cookie-sync.js      Silent sync: decrypt a profile's cookies, read the Flow balance
 public/                      Dashboard (index.html, app.js, styles.css)
 extension/                   Chrome extension (Manifest V3)
   content.js                 Reads the Flow account panel
@@ -96,7 +100,7 @@ data/                        Local database, backup, settings, log (git-ignored)
 
 | Problem | Fix |
 |---|---|
-| An account shows "Extension not installed" | Install the extension in that profile via **Set up extension**. |
+| The first sync does nothing / no prompt | macOS needs the Keychain prompt approved. Run **⟳ Sync all** and click **Always Allow**. If you clicked Deny, open **Keychain Access**, find **Chrome Safe Storage**, and allow `node` access — or sync still works via the extension fallback. |
 | An account failed to sync | Hover its chip in the sync panel for the reason. Usually it isn't signed in to Flow in that profile. |
 | A sync window didn't close | Reload the extension once in that profile (`chrome://extensions` → ↻). Versions before 2.4 can't update themselves. |
 | The dashboard doesn't load | Double-click **Start Flow Credits.command**, or check `data/server.log`. |
