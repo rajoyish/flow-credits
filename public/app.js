@@ -316,6 +316,7 @@ function renderSyncJob(job) {
   const items = job.items || [];
   const count = (st) => items.filter((i) => i.status === st).length;
   const current = items.find((i) => i.status === 'syncing');
+  const reconnectCount = items.filter((i) => i.status === 'failed' && i.error_code === 'AUTH_REQUIRED').length;
 
   $('syncPanel').classList.toggle('active', Boolean(job.running));
   $('syncPanel').classList.toggle('show-items', items.length > 0);
@@ -335,6 +336,9 @@ function renderSyncJob(job) {
     if (count('skipped')) parts.push(`${count('skipped')} skipped`);
     $('syncTitle').textContent = `Last sync ${timeAgo(job.finished_at)}: ${parts.join(', ')}`;
     $('syncSub').textContent = auto ? `Runs automatically every ${syncSettings.interval_hours} h. Hover an account for details.` : 'Automatic sync is off.';
+    if (reconnectCount) {
+      $('syncSub').textContent = `${reconnectCount} account${reconnectCount === 1 ? ' needs' : 's need'} Google sign-in. Click Reconnect, sign in to Flow, then sync again.`;
+    }
   } else {
     $('syncTitle').textContent = 'Sync';
     $('syncSub').textContent = auto ? `Runs automatically every ${syncSettings.interval_hours} h · last ${timeAgo(syncSettings.last_auto_sync_at)}` : 'Automatic sync is off.';
@@ -342,10 +346,13 @@ function renderSyncJob(job) {
 
   $('syncItems').innerHTML = items
     .map(
-      (i) =>
-        `<span class="sync-chip ${i.status}" title="${escapeHtml(i.message || i.status)}">${SYNC_ICON[i.status]} ${escapeHtml(i.label)}${
+      (i) => {
+        const reconnect = i.status === 'failed' && i.error_code === 'AUTH_REQUIRED';
+        const tag = reconnect ? 'button' : 'span';
+        return `<${tag} ${reconnect ? `type="button" data-reconnect-account="${escapeHtml(i.account_id)}"` : ''} class="sync-chip ${i.status}" title="${escapeHtml(i.message || i.status)}">${SYNC_ICON[i.status]} ${escapeHtml(i.label)}${
           i.status === 'synced' && i.credits !== null ? ` · ${Number(i.credits).toLocaleString()}` : ''
-        }</span>`
+        }${reconnect ? ' · Reconnect ↗' : ''}</${tag}>`;
+      }
     )
     .join('');
   updateAccountSyncButtons();
@@ -433,6 +440,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
 
   $('btnSyncAll').addEventListener('click', startSyncAll);
+  $('syncItems').addEventListener('click', (event) => {
+    const button = event.target.closest('[data-reconnect-account]');
+    if (button) openFlow(button.dataset.reconnectAccount);
+  });
   $('btnCancelSync').addEventListener('click', () => apiRequest('/api/sync-job/cancel', { method: 'POST', body: '{}' }).then(refreshSyncJob));
   $('autoSyncToggle').addEventListener('change', saveSyncSettings);
   $('autoSyncInterval').addEventListener('change', saveSyncSettings);

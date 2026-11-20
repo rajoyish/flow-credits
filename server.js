@@ -590,7 +590,7 @@ async function runSyncJob(trigger, accountIds = null) {
         if (!useCookie) {
           throw new Error('Background sync unavailable. Allow Chrome Safe Storage access in Keychain and restart the tracker.');
         }
-        const reading = await readFlowBalance(acc.chrome_profile);
+        const reading = await readFlowBalance(acc.chrome_profile, acc.email);
         const result = applyReading({ ...reading, account_id: acc.id });
         if (result.status !== 200) throw new Error(result.body.error || 'Reading rejected');
         item.status = 'synced';
@@ -598,6 +598,7 @@ async function runSyncJob(trigger, accountIds = null) {
         item.message = 'Synced in the background';
       } catch (err) {
         item.status = 'failed';
+        item.error_code = err.code || 'SYNC_FAILED';
         item.message = `Background sync failed: ${err.message}`;
       }
       broadcast('job');
@@ -854,6 +855,16 @@ function applyReading(body) {
   }
 
   writeJsonBackup();
+  // A user reconnecting through Flow can report a fresh reading via the extension
+  // after the background job has ended. Clear that account's stale failure chip.
+  const jobItem = syncJob.items.find((item) => item.account_id === target.id && item.status === 'failed');
+  if (jobItem) {
+    jobItem.status = 'synced';
+    jobItem.credits = updatedAvail;
+    jobItem.message = 'Synced after reconnecting';
+    delete jobItem.error_code;
+    broadcast('job');
+  }
   return {
     status: 200,
     body: {

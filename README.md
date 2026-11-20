@@ -103,7 +103,7 @@ data/                        Local database, backup, settings, log (git-ignored)
 | Problem | Fix |
 |---|---|
 | The first sync does nothing / no prompt | macOS needs the Keychain prompt approved. Run **⟳ Sync all** and click **Always Allow**. If you clicked Deny, open **Keychain Access**, find **Chrome Safe Storage**, and allow `node` access. |
-| An account failed to sync | Hover its chip in the sync panel for the reason. Usually it isn't signed in to Flow in that profile. |
+| An account failed to sync | Hover its chip for the reason. A **Reconnect** chip means Google rejected that profile's saved session: click it to open Flow in the linked profile, sign in if asked, then sync again. Repeating a background sync cannot restore a rejected login. With the extension installed, a fresh reading also clears the failed chip automatically. |
 | The dashboard doesn't load | Double-click **Start Flow Credits.command**, or check `data/server.log`. |
 | Port 3847 is busy | Start with another port: `PORT=4000 npm start` (the extension expects 3847). |
 
