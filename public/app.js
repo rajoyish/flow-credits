@@ -1,5 +1,6 @@
 const FLOW_URL = 'https://flow.google.com/';
-const state = { accounts: [], summary: {} };
+const state = { accounts: [], summary: {}, syncJob: { running: false, items: [] }, syncStarting: false };
+const accountFilters = { search: '', plan: 'all', sync: 'all', credits: 'all' };
 const $ = (id) => document.getElementById(id);
 
 /* ---------- helpers ---------- */
@@ -72,20 +73,38 @@ const isPro = (acc) => acc.is_synced && acc.reset_period !== 'daily';
 
 function sortedAccounts() {
   return [...state.accounts].sort((a, b) => {
-    if (isPro(a) !== isPro(b)) return isPro(a) ? -1 : 1;
     if (a.is_synced !== b.is_synced) return a.is_synced ? -1 : 1;
-    if (a.is_synced && b.urgency_score !== a.urgency_score) return b.urgency_score - a.urgency_score;
+    if (a.is_synced && b.available_credits !== a.available_credits) return b.available_credits - a.available_credits;
     return (a.label || a.email).localeCompare(b.label || b.email);
   });
+}
+
+function filteredAccounts() {
+  const search = accountFilters.search.trim().toLocaleLowerCase();
+  return sortedAccounts().filter((acc) => {
+    if (search && !`${acc.label || ''} ${acc.email || ''}`.toLocaleLowerCase().includes(search)) return false;
+    if (accountFilters.plan === 'pro' && !isPro(acc)) return false;
+    if (accountFilters.plan === 'free' && !(acc.is_synced && acc.reset_period === 'daily')) return false;
+    if (accountFilters.sync === 'synced' && !acc.is_synced) return false;
+    if (accountFilters.sync === 'unsynced' && acc.is_synced) return false;
+    if (accountFilters.credits === 'available' && !(acc.is_synced && acc.available_credits > 0)) return false;
+    if (accountFilters.credits === 'empty' && !(acc.is_synced && acc.available_credits === 0)) return false;
+    return true;
+  });
+}
+
+function clearAccountFilters() {
+  Object.assign(accountFilters, { search: '', plan: 'all', sync: 'all', credits: 'all' });
+  $('accountSearch').value = '';
+  for (const id of ['accountPlanFilter', 'accountSyncFilter', 'accountCreditsFilter']) $(id).value = 'all';
+  renderAccounts();
 }
 
 function creditsBox(acc) {
   if (!acc.is_synced) {
     const hint = state.summary.cookie_sync
-      ? 'Syncs automatically on the next “⟳ Sync all”.'
-      : acc.extension_installed
-        ? 'Extension installed. It syncs on the next “Sync all”.'
-        : `Extension not installed in this Chrome profile. <a href="#" onclick="openSetupModal(); return false;">Set up extension</a>`;
+      ? 'Click Sync to read this account’s balance in the background.'
+      : 'Background sync needs Chrome Safe Storage access in Keychain. Allow access and restart the tracker.';
     return `<div class="credit-meter-box unsynced"><div class="credits-total">Not synced yet</div><p class="unsynced-hint">${hint}</p></div>`;
   }
   const pct = acc.remaining_percent;
@@ -113,6 +132,10 @@ function creditsBox(acc) {
 
 function renderAccounts() {
   const container = $('accountsContainer');
+  const accounts = filteredAccounts();
+  const filtered = accountFilters.search.trim() || ['plan', 'sync', 'credits'].some((key) => accountFilters[key] !== 'all');
+  $('btnClearAccountFilters').hidden = !filtered;
+  $('accountResultsCount').textContent = `${accounts.length} of ${state.accounts.length} accounts · Most credits first`;
   if (!state.accounts.length) {
     container.innerHTML = `
       <div class="empty-state">
@@ -122,8 +145,12 @@ function renderAccounts() {
       </div>`;
     return;
   }
+  if (!accounts.length) {
+    container.innerHTML = '<div class="empty-state"><h3>No matching accounts</h3><p>Try another search or clear your filters.</p></div>';
+    return;
+  }
   const recId = state.summary.recommended_account_id;
-  container.innerHTML = `<div class="accounts-grid">${sortedAccounts()
+  container.innerHTML = `<div class="accounts-grid">${accounts
     .map((acc) => {
       const isRec = acc.id === recId;
       return `
@@ -141,11 +168,18 @@ function renderAccounts() {
           </div>
           ${creditsBox(acc)}
           <div class="card-actions">
+            <button class="btn btn-sm account-sync-btn" data-sync-account="${escapeHtml(acc.id)}" onclick="syncAccount('${acc.id}')">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="size-6" aria-hidden="true">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182m0-4.991v4.99" />
+              </svg>
+              <span>Sync</span>
+            </button>
             <button class="btn btn-sm" onclick="openFlow('${acc.id}')">Open Flow</button>
           </div>
         </div>`;
     })
     .join('')}</div>`;
+  updateAccountSyncButtons();
 }
 
 /* ---------- account actions ---------- */
@@ -224,7 +258,7 @@ function renderSetupBanner() {
   }
   const missing = state.accounts.filter((a) => a.chrome_profile && !a.extension_installed);
   $('setupBanner').style.display = missing.length ? 'flex' : 'none';
-  $('setupBannerText').textContent = `${missing.length} of ${state.accounts.length} Chrome profiles still need the extension (one-time setup).`;
+  $('setupBannerText').textContent = `${missing.length} of ${state.accounts.length} Chrome profiles can add the optional toolbar extension.`;
 }
 
 async function renderSetupList() {
@@ -262,7 +296,23 @@ function closeSetupModal() {
 const SYNC_ICON = { queued: '·', syncing: '⟳', synced: '✓', failed: '✗', skipped: '–' };
 let syncSettings = null;
 
+function updateAccountSyncButtons() {
+  const job = state.syncJob;
+  const busy = state.syncStarting || Boolean(job.running);
+  document.querySelectorAll('[data-sync-account]').forEach((button) => {
+    const item = job.items?.find((item) => item.account_id === button.dataset.syncAccount);
+    const syncing = job.running && item?.status === 'syncing';
+    button.disabled = busy;
+    button.classList.toggle('syncing', Boolean(syncing));
+    button.setAttribute('aria-busy', String(Boolean(syncing)));
+    button.querySelector('span').textContent = syncing ? 'Syncing…' : 'Sync';
+    button.title = item?.status === 'failed' ? item.message : 'Sync this account in the background';
+  });
+  $('btnSyncAll').disabled = busy;
+}
+
 function renderSyncJob(job) {
+  state.syncJob = job;
   const items = job.items || [];
   const count = (st) => items.filter((i) => i.status === st).length;
   const current = items.find((i) => i.status === 'syncing');
@@ -270,16 +320,15 @@ function renderSyncJob(job) {
   $('syncPanel').classList.toggle('active', Boolean(job.running));
   $('syncPanel').classList.toggle('show-items', items.length > 0);
   $('btnSyncAll').disabled = Boolean(job.running);
-  $('btnSyncAll').textContent = job.running ? '⟳ Syncing…' : '⟳ Sync all';
+  $('btnSyncAll').querySelector('span').textContent = job.running ? 'Syncing…' : 'Sync all';
+  $('btnSyncAll').classList.toggle('syncing', Boolean(job.running));
   $('btnCancelSync').style.display = job.running ? 'inline-flex' : 'none';
   $('syncFill').style.width = `${job.total ? Math.round((job.done / job.total) * 100) : 0}%`;
 
   const auto = syncSettings && syncSettings.auto_sync;
   if (job.running) {
     $('syncTitle').textContent = `Syncing ${Math.min(job.done + 1, job.total)} of ${job.total}${current ? ` · ${current.label}` : ''}`;
-    $('syncSub').textContent = state.summary.cookie_sync
-      ? 'Reading each account’s balance in the background. No windows open.'
-      : 'Opening Flow in each Chrome profile. Windows close by themselves.';
+    $('syncSub').textContent = 'Reading account balances in the background. No windows open.';
   } else if (job.finished_at) {
     const parts = [`${count('synced')} updated`];
     if (count('failed')) parts.push(`${count('failed')} failed`);
@@ -299,6 +348,7 @@ function renderSyncJob(job) {
         }</span>`
     )
     .join('');
+  updateAccountSyncButtons();
 }
 
 // Progress arrives as 'job' events from the tracker; no polling needed.
@@ -310,13 +360,30 @@ async function refreshSyncJob() {
   }
 }
 
-async function startSyncAll() {
+async function startSync(accountIds = null) {
+  if (state.syncStarting || state.syncJob.running) return;
+  state.syncStarting = true;
+  updateAccountSyncButtons();
   try {
-    await apiRequest('/api/sync-all', { method: 'POST', body: '{}' });
-    refreshSyncJob();
+    const job = await apiRequest('/api/sync-all', {
+      method: 'POST',
+      body: JSON.stringify(accountIds ? { account_ids: accountIds } : {})
+    });
+    renderSyncJob(job);
   } catch (err) {
     showToast(err.message, 'error');
+  } finally {
+    state.syncStarting = false;
+    updateAccountSyncButtons();
   }
+}
+
+function startSyncAll() {
+  return startSync();
+}
+
+function syncAccount(id) {
+  return startSync([id]);
 }
 
 async function saveSyncSettings() {
@@ -352,6 +419,18 @@ async function stopServer() {
 
 /* ---------- wiring ---------- */
 document.addEventListener('DOMContentLoaded', () => {
+  $('accountSearch').addEventListener('input', (event) => {
+    accountFilters.search = event.target.value;
+    renderAccounts();
+  });
+  for (const [id, key] of [['accountPlanFilter', 'plan'], ['accountSyncFilter', 'sync'], ['accountCreditsFilter', 'credits']]) {
+    $(id).addEventListener('change', (event) => {
+      accountFilters[key] = event.target.value;
+      renderAccounts();
+    });
+  }
+  $('btnClearAccountFilters').addEventListener('click', clearAccountFilters);
+
 
   $('btnSyncAll').addEventListener('click', startSyncAll);
   $('btnCancelSync').addEventListener('click', () => apiRequest('/api/sync-job/cancel', { method: 'POST', body: '{}' }).then(refreshSyncJob));

@@ -61,15 +61,17 @@ Turn on **Start at login** at the bottom of the dashboard to run the server in t
 
 The LaunchAgent points at the Node.js binary that was running when you turned the switch on. If that Node version is removed later, turn the switch off and on again.
 
+“Use next” chooses the largest remaining balance among accounts resetting within 7 days, then the earlier reset date when balances match. If none reset within 7 days, it chooses the nearest reset date, then the larger balance. Only synced, active accounts with credits qualify. Account cards remain sorted by highest available credits.
+
 ## How syncing works
 
 **Silent sync (default).** For each account, the server reads that Chrome profile's `flow.google.com` login cookies straight from disk, decrypts them with the key macOS keeps in your Keychain, and asks Flow for the balance and reset date over Flow's own request — the same data the account panel shows. Nothing opens on screen. All your accounts sync in a few seconds, and Chrome doesn't even need to be running.
 
 The Keychain key is read once per server run (the one-time *"Always Allow"* prompt); cookies are copied to a temp file and read there, never modified. See `lib/flow-cookie-sync.js`.
 
-**Window fallback.** If silent sync can't run (not macOS/Chrome, the Keychain prompt was declined, or a profile's cookies don't work), the server falls back to the old method for that account: it opens `https://flow.google.com/?fct_sync=1` in a new window of the profile, the extension reads the account panel and reports back, then the window closes itself. This path needs the extension installed in that profile.
+**Background only.** Use **Sync all** or the **Sync** button on an individual account. If Keychain access is unavailable or a profile’s cookies fail, the sync panel reports the failure. Syncing never opens a Chrome profile or window.
 
-Either way, opening Flow yourself in any profile also syncs that account, and the dashboard and popup update straight away.
+With the optional extension installed, opening Flow yourself also syncs that account, and the dashboard and popup update straight away.
 
 ## Data and privacy
 
@@ -77,7 +79,7 @@ Either way, opening Flow yourself in any profile also syncs that account, and th
 - **Settings and log:** auto-sync settings are in `data/settings.json`, and the server log in `data/server.log`.
 - **Local only:** the server only listens on `127.0.0.1`, the extension only talks to `localhost:3847`, and nothing is sent anywhere except directly to Google's own `flow.google.com` to read your balance — exactly as your browser does.
 - **What the server reads from Chrome:** Chrome's `Local State` file (to list profiles and their signed-in email), each profile's preferences file (to check whether the extension is installed), and — for silent sync — each profile's `flow.google.com` cookies, which it decrypts with the Chrome Safe Storage key from your Keychain and uses only to fetch that account's Flow credit balance. Cookies are read from a temporary copy and never modified; nothing is logged or stored beyond the balance and reset date. It does not read passwords or other sites' cookies.
-- **The `tabs` permission** (extension only) is used only to find and close the windows opened by the fallback sync.
+- **The `tabs` permission** (extension only) supports closing legacy sync tabs. The tracker no longer opens tabs for syncing.
 
 `data/` is excluded from git.
 
@@ -100,9 +102,8 @@ data/                        Local database, backup, settings, log (git-ignored)
 
 | Problem | Fix |
 |---|---|
-| The first sync does nothing / no prompt | macOS needs the Keychain prompt approved. Run **⟳ Sync all** and click **Always Allow**. If you clicked Deny, open **Keychain Access**, find **Chrome Safe Storage**, and allow `node` access — or sync still works via the extension fallback. |
+| The first sync does nothing / no prompt | macOS needs the Keychain prompt approved. Run **⟳ Sync all** and click **Always Allow**. If you clicked Deny, open **Keychain Access**, find **Chrome Safe Storage**, and allow `node` access. |
 | An account failed to sync | Hover its chip in the sync panel for the reason. Usually it isn't signed in to Flow in that profile. |
-| A sync window didn't close | Reload the extension once in that profile (`chrome://extensions` → ↻). Versions before 2.4 can't update themselves. |
 | The dashboard doesn't load | Double-click **Start Flow Credits.command**, or check `data/server.log`. |
 | Port 3847 is busy | Start with another port: `PORT=4000 npm start` (the extension expects 3847). |
 

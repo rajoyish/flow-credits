@@ -119,72 +119,11 @@ function daysUntilDate(dateStr, now = new Date()) {
 }
 
 /**
- * Automatically checks all accounts to see if their next_reset_date has arrived or passed.
- * If so, resets available_credits to monthly_allowance, advances next_reset_date to the next cycle,
- * and records an entry in credit_logs.
- */
-function processAutomaticMonthlyResets() {
-  const now = new Date();
-  const todayISO = formatDateISO(now);
-  const accounts = prepare('SELECT * FROM accounts').all();
-
-  const updateStmt = prepare(`
-    UPDATE accounts
-    SET available_credits = ?,
-        next_reset_date = ?,
-        last_reset_cycle = ?,
-        updated_at = ?
-    WHERE id = ?
-  `);
-
-  const logStmt = prepare(`
-    INSERT INTO credit_logs (id, account_id, delta, balance_after, reason, source, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  let anyReset = false;
-  for (const acc of accounts) {
-    if (acc.status === 'archived') continue;
-    if (acc.next_reset_date && acc.next_reset_date <= todayISO) {
-      const daily = acc.reset_period === 'daily';
-      const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
-      const newResetDate = daily ? formatDateISO(tomorrow) : computeNextResetDate(acc.reset_day, now);
-      const newBalance = acc.monthly_allowance;
-      const delta = newBalance - acc.available_credits;
-      const nowIso = now.toISOString();
-
-      updateStmt.run(
-        newBalance,
-        newResetDate,
-        todayISO,
-        nowIso,
-        acc.id
-      );
-
-      logStmt.run(
-        crypto.randomUUID(),
-        acc.id,
-        delta,
-        newBalance,
-        daily ? 'Daily refresh' : `Monthly cycle auto-reset (Reset day ${acc.reset_day})`,
-        'auto-reset',
-        nowIso
-      );
-      anyReset = true;
-    }
-  }
-
-  if (anyReset) {
-    writeJsonBackup();
-  }
-}
-
-/**
  * Enrich an account row with computed metrics:
  * - days_until_reset
  * - usage_percent
  * - burn_rate_needed (credits/day to use before reset)
- * - urgency_score (higher = use this account first so expiring credits aren't wasted)
+ * - urgency_score (credits to spend per day before reset)
  */
 function enrichAccount(acc) {
   const daysLeft = daysUntilDate(acc.next_reset_date);
@@ -259,8 +198,25 @@ function cookieSyncReady() {
   return cookieSyncReadyCache;
 }
 
+// Prioritize a useful balance while avoiding credits expiring within a week.
+// Among accounts in that window, use the largest balance first.
+function recommendAccount(accounts) {
+  const candidates = accounts.filter((a) =>
+    a.is_synced && a.status === 'active' && (a.available_credits > 0 || a.topup_credits > 0)
+  );
+  const expiringSoon = candidates.filter((a) => a.days_until_reset <= 7);
+  const balance = (a) => a.available_credits + (a.topup_credits || 0);
+  return (expiringSoon.length ? expiringSoon : candidates)
+    .sort((a, b) =>
+      (expiringSoon.length
+        ? balance(b) - balance(a) || a.days_until_reset - b.days_until_reset
+        : a.days_until_reset - b.days_until_reset || balance(b) - balance(a)) ||
+      (a.label || a.email).localeCompare(b.label || b.email) ||
+      a.id.localeCompare(b.id)
+    )[0] || null;
+}
+
 function getAllAccountsWithSummary() {
-  processAutomaticMonthlyResets();
   const rawAccounts = prepare('SELECT * FROM accounts ORDER BY created_at ASC').all();
   const enriched = rawAccounts.map((a) => ({
     ...enrichAccount(a),
@@ -268,16 +224,7 @@ function getAllAccountsWithSummary() {
   }));
   const synced = enriched.filter((a) => a.is_synced);
 
-  // Sort recommendation order: active accounts with available_credits > 0 ordered by highest urgency_score
-  const candidates = enriched
-    .filter((a) => a.is_synced && a.status === 'active' && (a.available_credits > 0 || a.topup_credits > 0))
-    .sort((a, b) => {
-      if (b.urgency_score !== a.urgency_score) return b.urgency_score - a.urgency_score;
-      if (a.days_until_reset !== b.days_until_reset) return a.days_until_reset - b.days_until_reset;
-      return b.available_credits - a.available_credits;
-    });
-
-  const recommendedAccount = candidates[0] || null;
+  const recommendedAccount = recommendAccount(enriched);
 
   const summary = {
     total_accounts: enriched.length,
@@ -535,13 +482,10 @@ function profileHasExtension(profileDir) {
 }
 
 /* ------------------------------------------------------------------ *
- * Background "sync all" runner.
- * Opens flow.google.com in each account's Chrome profile, one at a time.
- * The extension reads the balance, posts it to /api/sync-inbound, and
- * closes the tab when the server says it was opened for this job.
+ * Background sync runner. Reads balances directly using profile cookies.
+ * Failures are reported in the job; syncing never launches Chrome.
  * ------------------------------------------------------------------ */
 const SETTINGS_PATH = path.join(DATA_DIR, 'settings.json');
-const SYNC_TIMEOUT_MS = 45000;
 
 /* ------------------------------------------------------------------ *
  * Start at login: a per-user LaunchAgent that runs this server when you log in.
@@ -594,31 +538,11 @@ function writeSettings(patch) {
 }
 
 let syncJob = { running: false, items: [] };
-let pendingWaiter = null; // { email, resolve }
 
 function publicJob() {
   const { items = [], ...rest } = syncJob;
   const done = items.filter((i) => ['synced', 'failed', 'skipped'].includes(i.status)).length;
   return { ...rest, total: items.length, done, items };
-}
-
-/** Called from /api/sync-inbound. Returns true when the reading answers the job's current account. */
-function resolveJobItem(email, credits) {
-  if (!syncJob.running || !pendingWaiter || pendingWaiter.email !== email) return false;
-  pendingWaiter.resolve(credits);
-  return true;
-}
-
-function openFlowInProfile(profileDir) {
-  const browserBin = findMacBrowserBinary();
-  if (!browserBin || !browserBin.includes('Google Chrome')) throw new Error('Google Chrome not found');
-  // `fct_sync` tells the extension this tab was opened for a sync job.
-  // --new-window keeps the sync tab alone in its window so the extension can close the whole window afterwards.
-  const child = spawn(browserBin, [`--profile-directory=${profileDir}`, '--new-window', 'https://flow.google.com/?fct_sync=1'], {
-    detached: true,
-    stdio: 'ignore'
-  });
-  child.unref();
 }
 
 async function runSyncJob(trigger, accountIds = null) {
@@ -645,7 +569,7 @@ async function runSyncJob(trigger, accountIds = null) {
 
   (async () => {
     // Silent sync reads each profile's Flow balance from its cookies, no window opened.
-    // It needs no extension; the window method stays as the fallback.
+    // It needs no extension and never falls back to opening a browser.
     const useCookie = cookieSyncReady();
     for (const item of syncJob.items) {
       if (syncJob.cancelled) {
@@ -662,63 +586,21 @@ async function runSyncJob(trigger, accountIds = null) {
       item.status = 'syncing';
       broadcast('job');
 
-      // 1) Preferred: silent sync straight from the profile's cookies.
-      if (useCookie) {
-        try {
-          const reading = await readFlowBalance(acc.chrome_profile);
-          const result = applyReading({ ...reading, account_id: acc.id });
-          if (result.status !== 200) throw new Error(result.body.error || 'Reading rejected');
-          item.status = 'synced';
-          item.credits = reading.available_credits;
-          item.message = 'Synced silently';
-          broadcast('job');
-          continue;
-        } catch (err) {
-          item.message = `Silent sync failed: ${err.message}`;
-          broadcast('job');
-          // Fall through to the window method if the extension is available.
-        }
-      }
-
-      // 2) Fallback: open Flow in the profile and let the extension report back.
-      if (!profileHasExtension(acc.chrome_profile)) {
-        // Silent sync off and no extension => nothing can sync this one (skip).
-        // Silent sync tried and failed with no extension to fall back to => surface the failure.
-        item.status = useCookie ? 'failed' : 'skipped';
-        if (!useCookie) item.message = 'Extension not installed in this Chrome profile';
-        broadcast('job');
-        continue;
-      }
       try {
-        const credits = await new Promise((resolve, reject) => {
-          // Every exit path clears the timer and the waiter, so nothing outlives this account.
-          let timer = null;
-          const settle = (fn, value) => {
-            clearTimeout(timer);
-            if (pendingWaiter && pendingWaiter.email === acc.email) pendingWaiter = null;
-            fn(value);
-          };
-          timer = setTimeout(() => settle(reject, new Error('No reply from Flow. Signed in? Panel changed?')), SYNC_TIMEOUT_MS);
-          pendingWaiter = {
-            email: acc.email,
-            resolve: (c) => settle(resolve, c),
-            cancel: () => settle(reject, new Error('Cancelled'))
-          };
-          try {
-            openFlowInProfile(acc.chrome_profile);
-          } catch (err) {
-            settle(reject, err);
-          }
-        });
+        if (!useCookie) {
+          throw new Error('Background sync unavailable. Allow Chrome Safe Storage access in Keychain and restart the tracker.');
+        }
+        const reading = await readFlowBalance(acc.chrome_profile);
+        const result = applyReading({ ...reading, account_id: acc.id });
+        if (result.status !== 200) throw new Error(result.body.error || 'Reading rejected');
         item.status = 'synced';
-        item.credits = credits;
-        item.message = '';
-        broadcast('job');
+        item.credits = reading.available_credits;
+        item.message = 'Synced in the background';
       } catch (err) {
         item.status = 'failed';
-        item.message = err.message;
-        broadcast('job');
+        item.message = `Background sync failed: ${err.message}`;
       }
+      broadcast('job');
     }
     syncJob.running = false;
     syncJob.finished_at = new Date().toISOString();
@@ -915,7 +797,7 @@ function applyReading(body) {
       body: {
         ok: true,
         action: 'created',
-        close_tab: resolveJobItem(email, aCredits),
+        close_tab: false,
         email,
         available_credits: aCredits,
         ...getAllAccountsWithSummary()
@@ -977,7 +859,7 @@ function applyReading(body) {
     body: {
       ok: true,
       action: 'updated',
-      close_tab: resolveJobItem(target.email, updatedAvail),
+      close_tab: false,
       email: target.email,
       available_credits: updatedAvail,
       next_reset_date: updatedNextReset,
@@ -1133,7 +1015,6 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && pathname === '/api/sync-job/cancel') {
       syncJob.cancelled = true;
-      if (pendingWaiter) pendingWaiter.cancel();
       return sendJson(res, 200, publicJob());
     }
     if (pathname === '/api/settings') {

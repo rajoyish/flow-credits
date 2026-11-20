@@ -637,3 +637,45 @@ kbd {
   color: #fff;
   background: linear-gradient(135deg, #6366f1 0%, #06b6d4 100%);
 }
+
+.account-sync-btn svg, #btnSyncAll svg { width: 16px; height: 16px; }
+.btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.account-sync-btn.syncing svg, #btnSyncAll.syncing svg { animation: sync-spin 1s linear infinite; }
+@keyframes sync-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .account-sync-btn.syncing svg, #btnSyncAll.syncing svg { animation: none; }
+}
+
+/* Account search and filters */
+.account-toolbar {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 24px;
+}
+.account-toolbar label { display: flex; flex-direction: column; gap: 6px; }
+.account-toolbar label > span { color: var(--text-secondary); font-size: 12px; font-weight: 600; }
+.account-search { flex: 1 1 240px; }
+.account-toolbar input, .account-toolbar select {
+  min-height: 40px;
+  padding: 8px 12px;
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-size: 13px;
+}
+.account-toolbar input::placeholder { color: var(--text-muted); }
+.account-toolbar input:focus-visible, .account-toolbar select:focus-visible {
+  outline: 2px solid var(--accent-hover);
+  outline-offset: 2px;
+}
+.account-toolbar button { min-height: 40px; }
+.account-toolbar [hidden] { display: none; }
+#accountResultsCount { flex-basis: 100%; color: var(--text-secondary); font-size: 12px; }
+@media (max-width: 600px) {
+  .account-search { flex-basis: 100%; }
+  .account-toolbar label:not(.account-search) { flex: 1 1 120px; }
+}
