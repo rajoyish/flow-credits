@@ -102,9 +102,7 @@ function clearAccountFilters() {
 
 function creditsBox(acc) {
   if (!acc.is_synced) {
-    const hint = state.summary.cookie_sync
-      ? 'Click Sync to read this account’s balance in the background.'
-      : 'Background sync needs Chrome Safe Storage access in Keychain. Allow access and restart the tracker.';
+    const hint = 'Click Sync to check this account’s Flow balance.';
     return `<div class="credit-meter-box unsynced"><div class="credits-total">Not synced yet</div><p class="unsynced-hint">${hint}</p></div>`;
   }
   const pct = acc.remaining_percent;
@@ -306,7 +304,7 @@ function updateAccountSyncButtons() {
     button.classList.toggle('syncing', Boolean(syncing));
     button.setAttribute('aria-busy', String(Boolean(syncing)));
     button.querySelector('span').textContent = syncing ? 'Syncing…' : 'Sync';
-    button.title = item?.status === 'failed' ? item.message : 'Sync this account in the background';
+    button.title = item?.status === 'failed' ? item.message : 'Sync this account’s Flow balance';
   });
   $('btnSyncAll').disabled = busy;
 }
@@ -316,7 +314,8 @@ function renderSyncJob(job) {
   const items = job.items || [];
   const count = (st) => items.filter((i) => i.status === st).length;
   const current = items.find((i) => i.status === 'syncing');
-  const reconnectCount = items.filter((i) => i.status === 'failed' && i.error_code === 'AUTH_REQUIRED').length;
+  const waitingForReading = items.filter((i) => i.status === 'failed' && i.error_code === 'CHROME_READING_PENDING').length;
+  const missingProfiles = items.filter((i) => i.status === 'failed' && i.error_code === 'PROFILE_MISSING').length;
 
   $('syncPanel').classList.toggle('active', Boolean(job.running));
   $('syncPanel').classList.toggle('show-items', items.length > 0);
@@ -329,16 +328,19 @@ function renderSyncJob(job) {
   const auto = syncSettings && syncSettings.auto_sync;
   if (job.running) {
     $('syncTitle').textContent = `Syncing ${Math.min(job.done + 1, job.total)} of ${job.total}${current ? ` · ${current.label}` : ''}`;
-    $('syncSub').textContent = 'Reading account balances in the background. No windows open.';
+    $('syncSub').textContent = items.some((i) => i.status === 'syncing' && i.browser_opened)
+      ? 'Checking Flow in Chrome profiles that need recovery.'
+      : 'Checking saved Flow sessions.';
   } else if (job.finished_at) {
     const parts = [`${count('synced')} updated`];
     if (count('failed')) parts.push(`${count('failed')} failed`);
     if (count('skipped')) parts.push(`${count('skipped')} skipped`);
     $('syncTitle').textContent = `Last sync ${timeAgo(job.finished_at)}: ${parts.join(', ')}`;
     $('syncSub').textContent = auto ? `Runs automatically every ${syncSettings.interval_hours} h. Hover an account for details.` : 'Automatic sync is off.';
-    if (reconnectCount) {
-      $('syncSub').textContent = `${reconnectCount} account${reconnectCount === 1 ? ' needs' : 's need'} Google sign-in. Click Reconnect, sign in to Flow, then sync again.`;
-    }
+    const recovery = [];
+    if (waitingForReading) recovery.push(`Flow is open for ${waitingForReading} ${waitingForReading === 1 ? 'account' : 'accounts'}. Sign in if prompted, then click Sync all.`);
+    if (missingProfiles) recovery.push(`${missingProfiles} ${missingProfiles === 1 ? 'account has' : 'accounts have'} no matching Chrome profile. Sign in to Chrome with ${missingProfiles === 1 ? 'that account' : 'those accounts'}, then click Sync all.`);
+    if (recovery.length) $('syncSub').textContent = recovery.join(' ');
   } else {
     $('syncTitle').textContent = 'Sync';
     $('syncSub').textContent = auto ? `Runs automatically every ${syncSettings.interval_hours} h · last ${timeAgo(syncSettings.last_auto_sync_at)}` : 'Automatic sync is off.';
@@ -346,13 +348,9 @@ function renderSyncJob(job) {
 
   $('syncItems').innerHTML = items
     .map(
-      (i) => {
-        const reconnect = i.status === 'failed' && i.error_code === 'AUTH_REQUIRED';
-        const tag = reconnect ? 'button' : 'span';
-        return `<${tag} ${reconnect ? `type="button" data-reconnect-account="${escapeHtml(i.account_id)}"` : ''} class="sync-chip ${i.status}" title="${escapeHtml(i.message || i.status)}">${SYNC_ICON[i.status]} ${escapeHtml(i.label)}${
-          i.status === 'synced' && i.credits !== null ? ` · ${Number(i.credits).toLocaleString()}` : ''
-        }${reconnect ? ' · Reconnect ↗' : ''}</${tag}>`;
-      }
+      (i) => `<span class="sync-chip ${i.status}" title="${escapeHtml(i.message || i.status)}">${SYNC_ICON[i.status]} ${escapeHtml(i.label)}${
+        i.status === 'synced' && i.credits !== null ? ` · ${Number(i.credits).toLocaleString()}` : ''
+      }</span>`
     )
     .join('');
   updateAccountSyncButtons();
@@ -440,10 +438,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
 
   $('btnSyncAll').addEventListener('click', startSyncAll);
-  $('syncItems').addEventListener('click', (event) => {
-    const button = event.target.closest('[data-reconnect-account]');
-    if (button) openFlow(button.dataset.reconnectAccount);
-  });
   $('btnCancelSync').addEventListener('click', () => apiRequest('/api/sync-job/cancel', { method: 'POST', body: '{}' }).then(refreshSyncJob));
   $('autoSyncToggle').addEventListener('change', saveSyncSettings);
   $('autoSyncInterval').addEventListener('change', saveSyncSettings);

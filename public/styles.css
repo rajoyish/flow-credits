@@ -560,8 +560,6 @@ body {
 .sync-chip.syncing { color: var(--accent-hover); border-color: var(--accent); }
 .sync-chip.synced { color: var(--success); }
 .sync-chip.failed { color: var(--danger); }
-button.sync-chip { font-family: inherit; cursor: pointer; }
-button.sync-chip:hover, button.sync-chip:focus-visible { border-color: currentColor; }
 
 /* Extension setup */
 .setup-banner {

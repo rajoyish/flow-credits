@@ -19,7 +19,7 @@ for (const email of ['other@example.com', '']) {
     await assert.rejects(fetchFlowBalance('fake-cookie', 'tracked@example.com', async () => {
       requests++;
       return new Response(session(email));
-    }), /different or unidentified Google account/);
+    }), { code: 'ACCOUNT_MISMATCH', message: /different or unidentified Google account/ });
     assert.equal(requests, 1);
   });
 }

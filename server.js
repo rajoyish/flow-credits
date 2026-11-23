@@ -1,25 +1,86 @@
 import http from 'node:http';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { spawn, execFile } from 'node:child_process';
 import crypto from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
+import { format } from 'node:util';
 import { cookieSyncAvailable, readFlowBalance } from './lib/flow-cookie-sync.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 3847);
-const DATA_DIR = path.join(__dirname, 'data');
+const LEGACY_DATA_DIR = path.join(__dirname, 'data');
+const DATA_DIR = process.env.FLOW_CREDITS_DATA_DIR
+  ? path.resolve(process.env.FLOW_CREDITS_DATA_DIR)
+  : path.join(os.homedir(), 'Desktop', 'Flow Credits');
 const DB_PATH = path.join(DATA_DIR, 'flow-credits.db');
 const JSON_BACKUP_PATH = path.join(DATA_DIR, 'accounts-backup.json');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
 fs.mkdirSync(PUBLIC_DIR, { recursive: true });
 
+// SQLite includes committed WAL entries when it creates the compact snapshot.
+// Use an exclusive link so an existing destination database is never replaced.
+const legacyDbPath = path.join(LEGACY_DATA_DIR, 'flow-credits.db');
+if (!process.env.FLOW_CREDITS_DATA_DIR && !fs.existsSync(DB_PATH) && fs.existsSync(legacyDbPath)) {
+  const stagingDir = fs.mkdtempSync(path.join(DATA_DIR, '.migration-'));
+  const snapshotPath = path.join(stagingDir, 'flow-credits.db');
+  try {
+    const legacyDb = new DatabaseSync(legacyDbPath, { readOnly: true });
+    try {
+      legacyDb.prepare('VACUUM INTO ?').run(snapshotPath);
+    } finally {
+      legacyDb.close();
+    }
+    fs.chmodSync(snapshotPath, 0o600);
+    for (const name of ['settings.json', 'accounts-backup.json', 'server.log']) {
+      const source = path.join(LEGACY_DATA_DIR, name);
+      const dest = path.join(DATA_DIR, name);
+      try {
+        fs.copyFileSync(source, dest, fs.constants.COPYFILE_EXCL);
+      } catch (err) {
+        if (err.code !== 'ENOENT' && err.code !== 'EEXIST') throw err;
+      }
+    }
+    try {
+      fs.linkSync(snapshotPath, DB_PATH);
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+    }
+  } finally {
+    fs.rmSync(snapshotPath, { force: true });
+    fs.rmdirSync(stagingDir);
+  }
+}
+
 const db = new DatabaseSync(DB_PATH);
+
+function writeServerLog(level, ...args) {
+  console[level](...args);
+  const logPath = path.join(DATA_DIR, 'server.log');
+  try {
+    fs.appendFileSync(logPath, `${format(...args)}\n`, { mode: 0o600 });
+    const size = fs.statSync(logPath).size;
+    if (size > 256 * 1024) {
+      const tail = Buffer.alloc(128 * 1024);
+      const log = fs.openSync(logPath, 'r');
+      try {
+        fs.readSync(log, tail, 0, tail.length, size - tail.length);
+      } finally {
+        fs.closeSync(log);
+      }
+      fs.writeFileSync(logPath, tail.subarray(tail.indexOf(10) + 1));
+    }
+  } catch (err) {
+    console.error('Failed to write tracker log:', err.message);
+  }
+}
 
 // Reuse prepared statements: preparing on every request churns native SQLite memory.
 const statementCache = new Map();
@@ -186,7 +247,7 @@ function writeJsonBackupNow() {
       'utf8'
     );
   } catch (err) {
-    console.error('Failed to write JSON backup:', err.message);
+    writeServerLog('error', 'Failed to write JSON backup:', err.message);
   }
 }
 
@@ -366,9 +427,11 @@ function parseGoogleCreditsText(text = '') {
 /**
  * Find Chrome / Brave / Chromium binary on macOS for isolated account session / profile launching.
  */
+const CHROME_BINARY = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+
 function findMacBrowserBinary() {
   const candidates = [
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    CHROME_BINARY,
     '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
     '/Applications/Arc.app/Contents/MacOS/Arc',
     '/Applications/Chromium.app/Contents/MacOS/Chromium',
@@ -381,8 +444,7 @@ function findMacBrowserBinary() {
 }
 
 /**
- * Launch an isolated Chrome window for a specific account (persisted in data/browser-profiles/<id>)
- * or open the user's specified Chrome Profile directly to Google One AI Credits & Google Flow.
+ * Open Google Flow in the account's linked Chrome profile.
  */
 function launchAccountBrowserSession(account, targetUrl) {
   const browserBin = findMacBrowserBinary();
@@ -400,7 +462,7 @@ function launchAccountBrowserSession(account, targetUrl) {
  * Read the signed-in Google account of every local Chrome profile from Chrome's "Local State" file.
  */
 const CHROME_LOCAL_STATE = path.join(
-  process.env.HOME || '',
+  os.homedir(),
   'Library/Application Support/Google/Chrome/Local State'
 );
 
@@ -450,6 +512,30 @@ function listChromeProfiles() {
 const EXTENSION_DIR = path.join(__dirname, 'extension');
 const CHROME_USER_DATA = path.dirname(CHROME_LOCAL_STATE);
 
+function chromeProfileExists(dir) {
+  return Boolean(dir && dir !== '.' && dir !== '..' && path.basename(dir) === dir &&
+    fs.statSync(path.join(CHROME_USER_DATA, dir), { throwIfNoEntry: false })?.isDirectory());
+}
+
+function resolveSyncProfile(account, profiles) {
+  const linked = account.chrome_profile;
+  const email = account.email.trim().toLowerCase();
+  const linkedEmail = profiles?.[linked]?.user_name?.trim().toLowerCase();
+  if (chromeProfileExists(linked) && (!profiles || Object.hasOwn(profiles, linked)) &&
+      (!linkedEmail || linkedEmail === email)) return linked;
+
+  const matches = Object.entries(profiles || {}).filter(([dir, info]) =>
+    info.user_name?.trim().toLowerCase() === email && chromeProfileExists(dir)
+  );
+  if (matches.length !== 1) return null;
+
+  const [replacement] = matches[0];
+  prepare('UPDATE accounts SET chrome_profile = ?, updated_at = ? WHERE id = ?')
+    .run(replacement, new Date().toISOString(), account.id);
+  writeJsonBackup();
+  return replacement;
+}
+
 // Cache only the answer per preferences file, keyed by its modification time (the files are large).
 const extensionCache = new Map(); // file path -> { mtimeMs, installed: true | false | null }
 
@@ -482,8 +568,7 @@ function profileHasExtension(profileDir) {
 }
 
 /* ------------------------------------------------------------------ *
- * Background sync runner. Reads balances directly using profile cookies.
- * Failures are reported in the job; syncing never launches Chrome.
+ * Sync settings and background-first sync runner.
  * ------------------------------------------------------------------ */
 const SETTINGS_PATH = path.join(DATA_DIR, 'settings.json');
 
@@ -500,6 +585,9 @@ function setStartAtLogin(enabled) {
     return;
   }
   const esc = (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const dataEnvironment = process.env.FLOW_CREDITS_DATA_DIR
+    ? `<key>EnvironmentVariables</key><dict><key>FLOW_CREDITS_DATA_DIR</key><string>${esc(DATA_DIR)}</string></dict>`
+    : '';
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -511,11 +599,11 @@ function setStartAtLogin(enabled) {
     <string>${esc(path.join(__dirname, 'server.js'))}</string>
   </array>
   <key>WorkingDirectory</key><string>${esc(__dirname)}</string>
+  ${dataEnvironment}
   <key>RunAtLoad</key><true/>
   <!-- Restart after a crash, but not after "Stop server" (clean exit). -->
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
-  <key>StandardOutPath</key><string>${esc(path.join(DATA_DIR, 'server.log'))}</string>
-  <key>StandardErrorPath</key><string>${esc(path.join(DATA_DIR, 'server.log'))}</string>
+  <key>StandardOutPath</key><string>/dev/null</string>
 </dict>
 </plist>
 `;
@@ -538,6 +626,80 @@ function writeSettings(patch) {
 }
 
 let syncJob = { running: false, items: [] };
+let syncController;
+const CHROME_RECOVERY_ERRORS = new Set(['COOKIE_UNAVAILABLE', 'AUTH_REQUIRED', 'ACCOUNT_MISMATCH', 'KEYCHAIN_UNAVAILABLE']);
+
+function finishSyncItem(item, status, message, errorCode) {
+  item.status = status;
+  item.message = message;
+  if (errorCode) item.error_code = errorCode;
+  else delete item.error_code;
+  broadcast('job');
+}
+
+async function syncFromCookies(item, profile, signal) {
+  const reading = await readFlowBalance(profile, item.email, signal);
+  signal.throwIfAborted();
+  if (item.status === 'synced') return;
+  const result = applyReading({ ...reading, account_id: item.account_id });
+  if (result.status !== 200) throw new Error(result.body.error || 'Reading rejected');
+  item.credits = result.body.available_credits;
+  finishSyncItem(item, 'synced', item.browser_opened ? 'Synced after opening Chrome' : 'Synced in the background');
+}
+
+async function recoverInChrome(item, profile, useCookie, signal) {
+  try {
+    signal.throwIfAborted();
+    const info = chromeProfileInfo()[profile];
+    const profileEmail = info?.user_name?.trim().toLowerCase();
+    if (!info || !chromeProfileExists(profile) || (profileEmail && profileEmail !== item.email.toLowerCase())) {
+      finishSyncItem(item, 'failed', 'Chrome profile is missing. Sign in to Chrome with this account, then sync again.', 'PROFILE_MISSING');
+      return;
+    }
+    if (!useCookie && !profileHasExtension(profile)) {
+      finishSyncItem(item, 'failed', 'Allow Chrome Safe Storage access or enable the Flow Credits extension for this profile.', 'KEYCHAIN_UNAVAILABLE');
+      return;
+    }
+    item.browser_opened = true;
+    finishSyncItem(item, 'syncing', 'Opening Flow in Chrome');
+    await new Promise((resolve, reject) => {
+      const child = spawn(CHROME_BINARY, [`--profile-directory=${profile}`, 'https://flow.google.com/'], {
+        detached: true, stdio: 'ignore'
+      });
+      child.once('error', reject);
+      child.once('spawn', resolve);
+      child.unref();
+    });
+    if (item.status === 'syncing') finishSyncItem(item, 'syncing', 'Waiting for a balance from Chrome');
+  } catch (err) {
+    if (signal.aborted) finishSyncItem(item, 'skipped', 'Cancelled');
+    else finishSyncItem(item, 'failed', `Could not open Chrome: ${err.message}`, 'CHROME_LAUNCH_FAILED');
+    return;
+  }
+
+  const retrySignal = AbortSignal.any([signal, AbortSignal.timeout(30000)]);
+  try {
+    while (item.status === 'syncing') {
+      await delay(5000, undefined, { signal: retrySignal });
+      if (!useCookie || item.status !== 'syncing') continue;
+      try {
+        await syncFromCookies(item, profile, retrySignal);
+      } catch (err) {
+        retrySignal.throwIfAborted();
+        if (!CHROME_RECOVERY_ERRORS.has(err.code)) throw err;
+      }
+    }
+  } catch (err) {
+    if (item.status === 'synced') return;
+    if (signal.aborted) finishSyncItem(item, 'skipped', 'Cancelled');
+    else if (retrySignal.aborted) {
+      const message = useCookie
+        ? 'Flow opened in Chrome. Sign in or select this account there, then sync again.'
+        : 'Flow opened in Chrome. Sign in there if prompted. Check that the Flow Credits extension is enabled or allow Chrome Safe Storage access.';
+      finishSyncItem(item, 'failed', message, 'CHROME_READING_PENDING');
+    } else finishSyncItem(item, 'failed', `Could not read Flow after opening Chrome: ${err.message}`, err.code || 'SYNC_FAILED');
+  }
+}
 
 function publicJob() {
   const { items = [], ...rest } = syncJob;
@@ -566,49 +728,59 @@ async function runSyncJob(trigger, accountIds = null) {
     }))
   };
   const accountById = new Map(accounts.map((a) => [a.id, a]));
+  syncController = new AbortController();
+  const { signal } = syncController;
 
   (async () => {
-    // Silent sync reads each profile's Flow balance from its cookies, no window opened.
-    // It needs no extension and never falls back to opening a browser.
     const useCookie = cookieSyncReady();
+    let profiles;
+    try {
+      profiles = chromeProfileInfo();
+    } catch {
+      // Existing profile directories can still be used for silent sync.
+    }
+    const recovery = [];
     for (const item of syncJob.items) {
-      if (syncJob.cancelled) {
-        item.status = 'skipped';
-        item.message = 'Cancelled';
+      if (signal.aborted) {
+        finishSyncItem(item, 'skipped', 'Cancelled');
         continue;
       }
       const acc = accountById.get(item.account_id);
-      if (!acc.chrome_profile) {
-        item.status = 'skipped';
-        item.message = 'No Chrome profile linked';
+      const profile = resolveSyncProfile(acc, profiles);
+      if (!profile) {
+        finishSyncItem(item, 'failed', 'No matching Chrome profile found. Sign in to Chrome with this account, then sync again.', 'PROFILE_MISSING');
         continue;
       }
-      item.status = 'syncing';
-      broadcast('job');
+      finishSyncItem(item, 'syncing', 'Reading saved Flow session');
 
       try {
         if (!useCookie) {
-          throw new Error('Background sync unavailable. Allow Chrome Safe Storage access in Keychain and restart the tracker.');
+          throw Object.assign(new Error('Chrome Safe Storage is unavailable.'), { code: 'KEYCHAIN_UNAVAILABLE' });
         }
-        const reading = await readFlowBalance(acc.chrome_profile, acc.email);
-        const result = applyReading({ ...reading, account_id: acc.id });
-        if (result.status !== 200) throw new Error(result.body.error || 'Reading rejected');
-        item.status = 'synced';
-        item.credits = reading.available_credits;
-        item.message = 'Synced in the background';
+        await syncFromCookies(item, profile, signal);
       } catch (err) {
-        item.status = 'failed';
-        item.error_code = err.code || 'SYNC_FAILED';
-        item.message = `Background sync failed: ${err.message}`;
+        if (signal.aborted) finishSyncItem(item, 'skipped', 'Cancelled');
+        else if (CHROME_RECOVERY_ERRORS.has(err.code)) {
+          recovery.push({ item, profile });
+          finishSyncItem(item, 'queued', 'Waiting to open Flow in Chrome');
+        } else finishSyncItem(item, 'failed', `Background sync failed: ${err.message}`, err.code || 'SYNC_FAILED');
       }
-      broadcast('job');
     }
+    await Promise.all(recovery.map(({ item, profile }) => recoverInChrome(item, profile, useCookie, signal)));
+  })().catch((err) => {
+    writeServerLog('error', 'Sync job failed:', err.message);
+    for (const item of syncJob.items) {
+      if (item.status === 'queued' || item.status === 'syncing') {
+        finishSyncItem(item, 'failed', 'Sync was interrupted. Try again.', 'SYNC_FAILED');
+      }
+    }
+  }).finally(() => {
     syncJob.running = false;
     syncJob.finished_at = new Date().toISOString();
     broadcast('job');
     broadcast('state');
     if (trigger === 'auto') writeSettings({ last_auto_sync_at: syncJob.finished_at });
-  })();
+  });
 
   broadcast('job');
   return publicJob();
@@ -698,7 +870,7 @@ function applyReading(body) {
   const nowIso = new Date().toISOString();
 
   const parsed = parseGoogleCreditsText(body.raw_text || '');
-  console.log(
+  writeServerLog('log',
     `[sync-inbound] ${body.email || '?'}: credits=${body.available_credits ?? parsed.available_credits} reset=${
       body.next_reset_date || parsed.next_reset_date
     } (${body.reset_period || parsed.reset_period || 'no date found'})`
@@ -855,15 +1027,12 @@ function applyReading(body) {
   }
 
   writeJsonBackup();
-  // A user reconnecting through Flow can report a fresh reading via the extension
-  // after the background job has ended. Clear that account's stale failure chip.
-  const jobItem = syncJob.items.find((item) => item.account_id === target.id && item.status === 'failed');
-  if (jobItem) {
-    jobItem.status = 'synced';
+  // Flow can report a reading through the extension during or after browser recovery.
+  const jobItem = syncJob.items.find((item) => item.account_id === target.id &&
+    (item.status === 'failed' || (item.status === 'syncing' && item.browser_opened)));
+  if (jobItem && body.source !== 'cookie-sync' && email === target.email.toLowerCase()) {
     jobItem.credits = updatedAvail;
-    jobItem.message = 'Synced after reconnecting';
-    delete jobItem.error_code;
-    broadcast('job');
+    finishSyncItem(jobItem, 'synced', 'Synced after reconnecting');
   }
   return {
     status: 200,
@@ -915,7 +1084,7 @@ const server = http.createServer(async (req, res) => {
         : body.closed_tab_only
           ? 'tab closed (window has your other tabs)'
           : 'nothing closed';
-      console.log(`[sync-closed] ${email}: ${note}`);
+      writeServerLog('log', `[sync-closed] ${email}: ${note}`);
       const item = [...(syncJob.items || [])].reverse().find((i) => i.email === email);
       if (item) {
         item.message = note;
@@ -1010,7 +1179,7 @@ const server = http.createServer(async (req, res) => {
     // POST /api/shutdown -> stop the tracker (clean exit, so the login agent won't restart it)
     if (req.method === 'POST' && pathname === '/api/shutdown') {
       sendJson(res, 200, { ok: true });
-      console.log('Stopped from the dashboard.');
+      writeServerLog('log', 'Stopped from the dashboard.');
       for (const c of sseClients) c.end();
       setTimeout(shutdown, 200);
       return;
@@ -1018,6 +1187,11 @@ const server = http.createServer(async (req, res) => {
 
     // Sync-all job: start / progress / cancel, and auto-sync settings
     if (req.method === 'POST' && pathname === '/api/sync-all') {
+      const { origin } = req.headers;
+      if (origin && origin !== `http://localhost:${PORT}` && origin !== `http://127.0.0.1:${PORT}` &&
+          !/^chrome-extension:\/\/[a-p]{32}$/.test(origin)) {
+        return sendJson(res, 403, { error: 'Start syncing from the local tracker or Chrome extension.' });
+      }
       const body = await readJsonBody(req).catch(() => ({}));
       return sendJson(res, 200, await runSyncJob('manual', Array.isArray(body.account_ids) ? body.account_ids : null));
     }
@@ -1026,6 +1200,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && pathname === '/api/sync-job/cancel') {
       syncJob.cancelled = true;
+      syncController?.abort();
       return sendJson(res, 200, publicJob());
     }
     if (pathname === '/api/settings') {
@@ -1087,7 +1262,7 @@ const server = http.createServer(async (req, res) => {
     res.end('Not Found');
   } catch (err) {
     if (err.message === 'Payload too large') return sendJson(res, 413, { error: err.message });
-    console.error('Server error:', err);
+    writeServerLog('error', 'Server error:', err);
     sendJson(res, 500, { error: err.message || 'Internal Server Error' });
   }
 });
@@ -1113,8 +1288,5 @@ server.on('error', (err) => {
 });
 
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(`\n========================================================`);
-  console.log(`  Flow Credits Tracker running on http://localhost:${PORT}`);
-  console.log(`  SQLite DB: ${DB_PATH}`);
-  console.log(`========================================================\n`);
+  writeServerLog('log', `Flow Credits Tracker running on http://localhost:${PORT} (SQLite DB: ${DB_PATH})`);
 });

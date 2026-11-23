@@ -3,7 +3,7 @@
 A local macOS dashboard that tracks the **Google Flow credits** of every Google account in your Chrome profiles, and tells you which account to use next before its credits reset.
 
 - Finds your Google accounts from your Chrome profiles: no forms to fill in.
-- Syncs every account's balance and reset date silently in the background — no windows open.
+- Syncs balances and reset dates in the background and opens Flow in Chrome profiles that need session recovery.
 - Knows the difference between **Google AI Pro** accounts (monthly reset) and **free** accounts (50 credits that refresh daily).
 - Recommends which account to use next, so monthly credits don't expire unused.
 - Includes an optional Chrome extension with a toolbar popup showing every account at a glance.
@@ -22,7 +22,7 @@ No `npm install` is needed: there are no dependencies.
 
 1. **Start the server.** Double-click **`Start Flow Credits.command`** (or run `npm start`). The dashboard opens at <http://localhost:3847>.
 2. **Add your accounts.** Click **+ Add accounts → Add all**. Accounts are read from your Chrome profiles.
-3. **Sync.** Click **⟳ Sync all**. The first sync shows a one-time macOS prompt — *"Flow Credits wants to use the Chrome Safe Storage key"* — click **Always Allow**. From then on it syncs silently and automatically, with no windows.
+3. **Sync.** Click **⟳ Sync all**. At the macOS prompt for the Chrome Safe Storage key, click **Always Allow**. The same sync runs on the schedule set in the **Auto-sync** panel.
 
 That's it. Syncing reads each profile's Flow balance in the background; **no Chrome extension is required.**
 
@@ -69,17 +69,20 @@ The LaunchAgent points at the Node.js binary that was running when you turned th
 
 The Keychain key is read once per server run (the one-time *"Always Allow"* prompt); cookies are copied to a temp file and read there, never modified. See `lib/flow-cookie-sync.js`.
 
-**Background only.** Use **Sync all** or the **Sync** button on an individual account. If Keychain access is unavailable or a profile’s cookies fail, the sync panel reports the failure. Syncing never opens a Chrome profile or window.
+**Chrome recovery.** Scheduled **Auto-sync**, **Sync all**, and per-account **Sync** first try the saved Flow session. For profiles with missing or expired Flow sessions, the tracker opens Flow in Chrome and retries the balance. An enabled Flow Credits extension can report the balance as soon as the page loads. If a tracked profile was deleted, the tracker relinks it when it finds exactly one existing Chrome profile signed in with the same email.
 
 With the optional extension installed, opening Flow yourself also syncs that account, and the dashboard and popup update straight away.
 
 ## Data and privacy
 
-- **Database:** account data is stored in `data/flow-credits.db` (SQLite), with an automatic JSON copy in `data/accounts-backup.json`.
-- **Settings and log:** auto-sync settings are in `data/settings.json`, and the server log in `data/server.log`.
+- **Database:** account data is stored in `~/Desktop/Flow Credits/flow-credits.db` (SQLite), with an automatic JSON copy in `accounts-backup.json` in the same folder.
+- **Settings and log:** auto-sync settings are in `settings.json`. The tracker writes to `server.log` and keeps roughly the latest 128 KB when the log exceeds 256 KB.
+- **Upgrade:** the first start with the default location copies the previous tracker files from the project's `data/` folder and compacts the SQLite database. The old files remain available as a backup. If Start at login was already enabled, toggle it off and back on to refresh the service configuration for the next login.
+- **Custom location:** set `FLOW_CREDITS_DATA_DIR` to use an explicit data folder.
+- **Chrome cleanup:** the tracker’s saved credit history lives outside Chrome. In Chrome’s **Delete browsing data** dialog, select **Cached images and files** only to clear the browser cache while keeping sign-ins for sync.
 - **Local only:** the server only listens on `127.0.0.1`, the extension only talks to `localhost:3847`, and nothing is sent anywhere except directly to Google's own `flow.google.com` to read your balance — exactly as your browser does.
 - **What the server reads from Chrome:** Chrome's `Local State` file (to list profiles and their signed-in email), each profile's preferences file (to check whether the extension is installed), and — for silent sync — each profile's `flow.google.com` cookies, which it decrypts with the Chrome Safe Storage key from your Keychain and uses only to fetch that account's Flow credit balance. Cookies are read from a temporary copy and never modified; nothing is logged or stored beyond the balance and reset date. It does not read passwords or other sites' cookies.
-- **The `tabs` permission** (extension only) supports closing legacy sync tabs. The tracker no longer opens tabs for syncing.
+- **The `tabs` permission** (extension only) supports closing legacy sync tabs. Chrome recovery tabs stay open so you can sign in if needed.
 
 `data/` is excluded from git.
 
@@ -95,7 +98,7 @@ extension/                   Chrome extension (Manifest V3)
   popup.html, popup.js       Toolbar popup
   icons/                     Extension icons
 Start Flow Credits.command   Double-click launcher
-data/                        Local database, backup, settings, log (git-ignored)
+data/                        Legacy tracker files (git-ignored)
 ```
 
 ## Troubleshooting
@@ -103,7 +106,7 @@ data/                        Local database, backup, settings, log (git-ignored)
 | Problem | Fix |
 |---|---|
 | The first sync does nothing / no prompt | macOS needs the Keychain prompt approved. Run **⟳ Sync all** and click **Always Allow**. If you clicked Deny, open **Keychain Access**, find **Chrome Safe Storage**, and allow `node` access. |
-| An account failed to sync | Hover its chip for the reason. A **Reconnect** chip means Google rejected that profile's saved session: click it to open Flow in the linked profile, sign in if asked, then sync again. Repeating a background sync cannot restore a rejected login. With the extension installed, a fresh reading also clears the failed chip automatically. |
+| An account failed to sync | Hover its chip for the reason. If Flow opened and asks you to sign in, sign in there and click **Sync all** again. If the profile is missing, sign in to Chrome with that account so the tracker can find its replacement. |
 | The dashboard doesn't load | Double-click **Start Flow Credits.command**, or check `data/server.log`. |
 | Port 3847 is busy | Start with another port: `PORT=4000 npm start` (the extension expects 3847). |
 
