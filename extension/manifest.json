@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Flow Credits Auto-Sync (Google AI Pro)",
-  "version": "2.10.0",
+  "version": "2.10.1",
   "description": "Automatically detects your Google account and syncs Google Flow credits & reset dates to your local Flow Credits Tracker.",
   "permissions": [
     "tabs"

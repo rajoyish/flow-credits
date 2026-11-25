@@ -663,7 +663,8 @@ async function recoverInChrome(item, profile, useCookie, signal) {
     item.browser_opened = true;
     finishSyncItem(item, 'syncing', 'Opening Flow in Chrome');
     await new Promise((resolve, reject) => {
-      const child = spawn(CHROME_BINARY, [`--profile-directory=${profile}`, 'https://flow.google.com/'], {
+      // `fct_sync` tells the extension this tab was opened for a sync job, so it closes it afterwards.
+      const child = spawn(CHROME_BINARY, [`--profile-directory=${profile}`, '--new-window', 'https://flow.google.com/?fct_sync=1'], {
         detached: true, stdio: 'ignore'
       });
       child.once('error', reject);
@@ -1030,16 +1031,19 @@ function applyReading(body) {
   // Flow can report a reading through the extension during or after browser recovery.
   const jobItem = syncJob.items.find((item) => item.account_id === target.id &&
     (item.status === 'failed' || (item.status === 'syncing' && item.browser_opened)));
-  if (jobItem && body.source !== 'cookie-sync' && email === target.email.toLowerCase()) {
+  const fromExtension = body.source !== 'cookie-sync' && email === target.email.toLowerCase();
+  if (jobItem && fromExtension) {
     jobItem.credits = updatedAvail;
     finishSyncItem(jobItem, 'synced', 'Synced after reconnecting');
   }
+  // Close the Chrome window the sync job opened once it has reported this account's balance.
+  const closeTab = fromExtension && syncJob.items.some((item) => item.account_id === target.id && item.browser_opened);
   return {
     status: 200,
     body: {
       ok: true,
       action: 'updated',
-      close_tab: false,
+      close_tab: closeTab,
       email: target.email,
       available_credits: updatedAvail,
       next_reset_date: updatedNextReset,

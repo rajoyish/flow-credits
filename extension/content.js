@@ -17,7 +17,20 @@
   const closeThisTab = (email) => {
     if (alive()) chrome.runtime.sendMessage({ type: 'FLOW_CREDITS_CLOSE_TAB', email }).catch(() => {});
   };
-  if (openedForSync) setTimeout(closeThisTab, 40000); // never leave a stray tab behind
+  // Never leave a stray sync tab behind, but don't close it while the user still has to sign in:
+  // the countdown starts only once Flow shows a signed-in account. Signing in navigates away and back,
+  // so each Flow page load waits for the account again.
+  const signedIn = () => Boolean(document.querySelector('[aria-label="Account details"]'));
+  if (openedForSync) {
+    (async () => {
+      while (!signedIn()) {
+        if (!alive()) return;
+        await sleep(1000);
+      }
+      await sleep(40000);
+      closeThisTab();
+    })();
+  }
 
   function detectEmail() {
     // Google's avatar: aria-label="Google Account: Name (you@gmail.com), ..."
